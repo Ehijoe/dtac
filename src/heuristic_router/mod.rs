@@ -23,7 +23,7 @@ const ALPHA: f64 = 2.0;
 ///
 /// It uses a combination of heuristics and a base weight to determine
 /// the final score for a given request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct HeuristicRouter {
     /// Baseline Prior Log-Odds (L_0)
     l_0: f64,
@@ -45,7 +45,7 @@ impl HeuristicRouter {
             w_asn: 1.5,
             w_fav: 1.2,
             w_hdr: 1.0,
-            space_saver: SpaceSaver::new(),
+            space_saver: SpaceSaver::new(10000), // Default capacity of 10000 IPs
         }
     }
 

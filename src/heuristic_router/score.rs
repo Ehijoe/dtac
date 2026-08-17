@@ -12,10 +12,10 @@ impl AiScore {
     /// Creates a new `AiScore`.
     ///
     /// The provided value is automatically clamped to be within the
-    /// range of `0.0` to `100.0` to ensure safe operation.
+    /// range of `0.0` to `1.0` to ensure safe operation.
     pub(crate) fn new(value: f64) -> Self {
-        // Clamp between 0.0 and 100.0 for safety
-        let clamped = value.clamp(0.0, 100.0);
+        // Clamp between 0.0 and 1.0 for safety
+        let clamped = value.clamp(0.0, 1.0);
         Self { value: clamped }
     }
 
