@@ -45,7 +45,7 @@ impl HeuristicRouter {
             w_asn: 1.5,
             w_fav: 1.2,
             w_hdr: 1.0,
-            space_saver: SpaceSaver::new(10000), // Default capacity of 10000 IPs
+            space_saver: SpaceSaver::new(10000, 3600), // Default capacity 10000 IPs, 1 hour TTL
         }
     }
 

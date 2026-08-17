@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// State for a single IP address.
 #[derive(Debug, Clone, Copy, Default)]
@@ -24,6 +25,8 @@ struct State {
     // Ordered set of (Count, IP) to easily pop the minimum count.
     // BTreeSet naturally orders tuples by the first element, then the second.
     counts: BTreeSet<(usize, IpAddr)>,
+    // Ordered set of (last_seen, IP) to easily pop the oldest IPs.
+    times: BTreeSet<(u64, IpAddr)>,
 }
 
 /// SpaceSaver tracks recent IPs in strictly bounded memory, evicting the lowest-volume
@@ -31,25 +34,60 @@ struct State {
 #[derive(Debug)]
 pub struct SpaceSaver {
     capacity: usize,
+    ttl_seconds: u64, // How long an IP can be inactive before it is evicted
     state: Mutex<State>,
 }
 
 impl SpaceSaver {
     /// Initializes a new SpaceSaver with a strict maximum memory capacity.
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, ttl_seconds: u64) -> Self {
         Self {
             capacity,
+            ttl_seconds,
             state: Mutex::new(State {
                 lookup: HashMap::with_capacity(capacity),
                 counts: BTreeSet::new(),
+                times: BTreeSet::new(),
             }),
+        }
+    }
+
+    /// Helper to get the current time in seconds
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// Removes all IPs that haven't been seen within `ttl_seconds`
+    fn prune_stale(state: &mut State, ttl_seconds: u64, now: u64) {
+        let expiration_threshold = now.saturating_sub(ttl_seconds);
+
+        // Repeatedly check the oldest item
+        while let Some(&(oldest_time, oldest_ip)) = state.times.first() {
+            if oldest_time < expiration_threshold {
+                // The IP is stale, remove it from all three collections
+                if let Some(removed_state) = state.lookup.remove(&oldest_ip) {
+                    state.counts.remove(&(removed_state.count, oldest_ip));
+                }
+                state.times.pop_first();
+            } else {
+                // The oldest IP is still valid, so all subsequent IPs are valid too
+                break;
+            }
         }
     }
 
     /// Fetches the state for `client_ip`. If it doesn't exist, adds it.
     /// If memory is full, evicts the lowest-volume IP.
     pub async fn get_or_add_and_evict(&self, client_ip: IpAddr) -> IpState {
-        let state = self.state.lock().unwrap();
+        // Note: Made `state` mutable so we can prune it
+        let mut state = self.state.lock().unwrap();
+        let now = Self::now();
+
+        // 1. Clean up stale entries first to free up capacity
+        Self::prune_stale(&mut state, self.ttl_seconds, now);
 
         // Case 1: The IP is already being tracked.
         if let Some(existing_state) = state.lookup.get(&client_ip).cloned() {
@@ -58,34 +96,37 @@ impl SpaceSaver {
 
         // Case 2: The IP is new, and we have not hit our memory limit.
         if state.lookup.len() < self.capacity {
-            // Return an initialized state and let `update` commit it.
-            return IpState { count: 1, ..Default::default() };
+            return IpState { count: 1, last_seen: now, ..Default::default() };
         }
 
         // Case 3: Memory is FULL.
-        // We evict the lowest count, increment it, and start a new state with that base count to bound the error rate.
+        // Standard SpaceSaver eviction (because we already removed expired ones)
         if let Some(&(min_count, _)) = state.counts.first() {
-            // We just return a new state inheriting the `min_count` as the base.
             let inherited_count = min_count + 1;
-            return IpState { count: inherited_count, ..Default::default() };
+            return IpState { count: inherited_count, last_seen: now, ..Default::default() };
         }
 
-        // Fallback for an empty capacity bounds (which shouldn't happen unless capacity=0)
-        IpState { count: 1, ..Default::default() }
+        IpState { count: 1, last_seen: now, ..Default::default() }
     }
 
     /// Updates the state for the given `client_ip`.
     /// This acts as the commit phase of the state, adjusting indices as required.
-    pub async fn update(&self, client_ip: IpAddr, new_ip_state: IpState) {
+    pub async fn update(&self, client_ip: IpAddr, mut new_ip_state: IpState) {
         let mut state = self.state.lock().unwrap();
-
-        // If the IP is already tracked, remove the old count entry from the BTreeSet.
-        // Needs cloned to avoid borrowing `state` during removal
-        let old_count_opt = state.lookup.get(&client_ip).map(|s| s.count);
         
-        if let Some(old_count) = old_count_opt {
-            state.counts.remove(&(old_count, client_ip));
+        // Ensure the last_seen time is updated
+        new_ip_state.last_seen = Self::now();
+
+        let old_state_opt = state.lookup.get(&client_ip).cloned();
+        
+        if let Some(old_state) = old_state_opt {
+            // Remove old entries from both BTreeSets
+            state.counts.remove(&(old_state.count, client_ip));
+            state.times.remove(&(old_state.last_seen, client_ip));
+            
+            // Insert updated state
             state.counts.insert((new_ip_state.count, client_ip));
+            state.times.insert((new_ip_state.last_seen, client_ip));
             state.lookup.insert(client_ip, new_ip_state);
             return;
         }
@@ -93,16 +134,21 @@ impl SpaceSaver {
         // If not tracked and under capacity, insert it.
         if state.lookup.len() < self.capacity {
             state.counts.insert((new_ip_state.count, client_ip));
+            state.times.insert((new_ip_state.last_seen, client_ip));
             state.lookup.insert(client_ip, new_ip_state);
             return;
         }
 
-        // If memory is full, we must evict the lowest-count item to make space.
+        // If memory is full, evict the lowest-count item to make space.
         if let Some((_min_count, min_ip)) = state.counts.pop_first() {
-            state.lookup.remove(&min_ip);
+            if let Some(evicted_state) = state.lookup.remove(&min_ip) {
+                // Must also remove from times index!
+                state.times.remove(&(evicted_state.last_seen, min_ip));
+            }
             
-            // Insert the new IP with its new state
+            // Insert the new IP
             state.counts.insert((new_ip_state.count, client_ip));
+            state.times.insert((new_ip_state.last_seen, client_ip));
             state.lookup.insert(client_ip, new_ip_state);
         }
     }
