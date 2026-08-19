@@ -306,6 +306,7 @@ mod tests {
         // Now getting ip3 should trigger pruning of ip2, so it won't be full and ip3 will get count 1
         let state3 = saver.get_or_add_and_evict(ip3).await;
         assert_eq!(state3.count, 1);
+        saver.update(ip3, state3).await;
         
         let state = saver.state.lock().unwrap();
         assert!(!state.lookup.contains_key(&ip2));
