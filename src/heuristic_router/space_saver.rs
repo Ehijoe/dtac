@@ -153,3 +153,163 @@ impl SpaceSaver {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_space_saver_basic_add_and_update() {
+        let saver = SpaceSaver::new(10, 3600);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        
+        let mut state = saver.get_or_add_and_evict(ip).await;
+        assert_eq!(state.count, 1);
+        
+        state.count = 5;
+        state.velocity = 100;
+        saver.update(ip, state).await;
+        
+        let new_state = saver.get_or_add_and_evict(ip).await;
+        assert_eq!(new_state.count, 5);
+        assert_eq!(new_state.velocity, 100);
+    }
+    
+    #[tokio::test]
+    async fn test_space_saver_eviction() {
+        let saver = SpaceSaver::new(2, 3600);
+        
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let ip3: IpAddr = "10.0.0.3".parse().unwrap();
+        
+        let mut state1 = saver.get_or_add_and_evict(ip1).await;
+        state1.count = 10;
+        saver.update(ip1, state1).await;
+        
+        let mut state2 = saver.get_or_add_and_evict(ip2).await;
+        state2.count = 5;
+        saver.update(ip2, state2).await;
+        
+        // This should evict ip2 because it has the lowest count (5) compared to ip1 (10)
+        let state3 = saver.get_or_add_and_evict(ip3).await;
+        assert_eq!(state3.count, 6); // Inherits min_count + 1 = 5 + 1
+    }
+
+    #[test]
+    fn test_prune_stale_logic() {
+        let mut state = State {
+            lookup: HashMap::new(),
+            counts: BTreeSet::new(),
+            times: BTreeSet::new(),
+        };
+        
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let ip3: IpAddr = "10.0.0.3".parse().unwrap();
+        
+        // IP1 is fresh
+        state.lookup.insert(ip1, IpState { count: 10, last_seen: 1000, ..Default::default() });
+        state.counts.insert((10, ip1));
+        state.times.insert((1000, ip1));
+        
+        // IP2 is stale
+        state.lookup.insert(ip2, IpState { count: 5, last_seen: 500, ..Default::default() });
+        state.counts.insert((5, ip2));
+        state.times.insert((500, ip2));
+        
+        // IP3 is right on the edge of becoming stale, but still valid
+        state.lookup.insert(ip3, IpState { count: 1, last_seen: 800, ..Default::default() });
+        state.counts.insert((1, ip3));
+        state.times.insert((800, ip3));
+
+        // Prune with ttl = 200, now = 1000. Threshold = 800.
+        // IP2 (500) should be removed. IP3 (800) and IP1 (1000) should stay.
+        SpaceSaver::prune_stale(&mut state, 200, 1000);
+        
+        assert!(state.lookup.contains_key(&ip1));
+        assert!(!state.lookup.contains_key(&ip2));
+        assert!(state.lookup.contains_key(&ip3));
+        assert_eq!(state.counts.len(), 2);
+        assert_eq!(state.times.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_update_untracked_when_full() {
+        let saver = SpaceSaver::new(2, 3600);
+        
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let ip3: IpAddr = "10.0.0.3".parse().unwrap();
+        
+        saver.update(ip1, IpState { count: 10, ..Default::default() }).await;
+        saver.update(ip2, IpState { count: 5, ..Default::default() }).await;
+        
+        // Memory is full. Update an untracked IP.
+        saver.update(ip3, IpState { count: 20, ..Default::default() }).await;
+        
+        let state = saver.state.lock().unwrap();
+        // ip2 should be evicted since it has the lowest count (5)
+        assert!(state.lookup.contains_key(&ip1));
+        assert!(!state.lookup.contains_key(&ip2));
+        assert!(state.lookup.contains_key(&ip3));
+        assert_eq!(state.lookup.get(&ip3).unwrap().count, 20);
+    }
+
+    #[tokio::test]
+    async fn test_update_existing_updates_indices() {
+        let saver = SpaceSaver::new(2, 3600);
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        
+        saver.update(ip1, IpState { count: 10, ..Default::default() }).await;
+        
+        {
+            let state = saver.state.lock().unwrap();
+            assert_eq!(state.counts.len(), 1);
+            assert_eq!(state.times.len(), 1);
+            assert!(state.counts.contains(&(10, ip1)));
+        }
+        
+        // Update the count of the existing IP
+        saver.update(ip1, IpState { count: 20, ..Default::default() }).await;
+        
+        {
+            let state = saver.state.lock().unwrap();
+            assert_eq!(state.counts.len(), 1);
+            assert_eq!(state.times.len(), 1);
+            assert!(state.counts.contains(&(20, ip1)));
+            assert!(!state.counts.contains(&(10, ip1)));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_or_add_and_evict_with_pruning() {
+        let saver = SpaceSaver::new(2, 3600);
+        
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let ip3: IpAddr = "10.0.0.3".parse().unwrap();
+        
+        saver.update(ip1, IpState { count: 10, ..Default::default() }).await;
+        saver.update(ip2, IpState { count: 5, ..Default::default() }).await;
+        
+        // Manually make ip2 stale
+        {
+            let mut state = saver.state.lock().unwrap();
+            let mut ip2_state = state.lookup.get(&ip2).unwrap().clone();
+            state.times.remove(&(ip2_state.last_seen, ip2));
+            ip2_state.last_seen = SpaceSaver::now() - 4000; // older than 3600
+            state.times.insert((ip2_state.last_seen, ip2));
+            state.lookup.insert(ip2, ip2_state);
+        }
+        
+        // Now getting ip3 should trigger pruning of ip2, so it won't be full and ip3 will get count 1
+        let state3 = saver.get_or_add_and_evict(ip3).await;
+        assert_eq!(state3.count, 1);
+        
+        let state = saver.state.lock().unwrap();
+        assert!(!state.lookup.contains_key(&ip2));
+        assert!(state.lookup.contains_key(&ip1));
+        assert!(state.lookup.contains_key(&ip3));
+    }
+}

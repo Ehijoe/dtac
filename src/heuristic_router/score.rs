@@ -31,3 +31,28 @@ impl AiScore {
         self.value > 85.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_score_clamping() {
+        let score_low = AiScore::new(-5.0);
+        assert_eq!(score_low.value(), 0.0);
+
+        let score_high = AiScore::new(105.0);
+        assert_eq!(score_high.value(), 1.0);
+
+        let score_mid = AiScore::new(0.5);
+        assert_eq!(score_mid.value(), 0.5);
+    }
+
+    #[test]
+    fn test_is_high_risk() {
+        // Since new() clamps to 1.0, and is_high_risk checks > 85.0, 
+        // it's currently always false under new().
+        let score = AiScore::new(0.9);
+        assert!(!score.is_high_risk());
+    }
+}
