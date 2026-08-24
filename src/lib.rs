@@ -10,6 +10,9 @@ pub mod cache_engine;
 pub mod error;
 /// Defines the common data structures and types used across the library.
 pub mod types;
+/// Defines the combined DTAC struct.
+pub mod dtac_cache;
 
 pub use types::RequestData;
 pub use heuristic_router::HeuristicRouter;
+pub use dtac_cache::DtacCache;
