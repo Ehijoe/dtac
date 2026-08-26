@@ -139,50 +139,82 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     /// * `requested_resource` - The key for the resource.
     /// * `request_bot_prob` - The AI-Score proxy probability of the request being a bot (0.0 to 1.0).
     /// * `fetch_from_origin` - A closure to fetch the resource payload if it's missing or promoted.
-    pub fn access<F>(
+    pub async fn access<F, Fut>(
         &self,
         requested_resource: K,
         request_bot_prob: f32,
         fetch_from_origin: F,
     ) -> P
     where
-        F: FnOnce(&K) -> P,
+        F: FnOnce(&K) -> Fut,
+        Fut: Future<Output = P>,
     {
         // Phase 1: Concurrency Management (Lock Sharding)
         let shard_id = Self::get_shard_id(&requested_resource);
-        let mut shard = self.shards[shard_id].lock().unwrap();
-        let current_time = Instant::now();
+        
+        let (action, payload) = {
+            let mut shard = self.shards[shard_id].lock().unwrap();
+            let current_time = Instant::now();
 
-        // Phase 2: Cache Hit Evaluation & Score Update
-        let in_main = shard.main_cache_map.contains_key(&requested_resource);
-        let in_ghost = shard.ghost_cache.contains_key(&requested_resource);
+            // Phase 2: Cache Hit Evaluation & Score Update
+            let in_main = shard.main_cache_map.contains_key(&requested_resource);
+            let in_ghost = shard.ghost_cache.contains_key(&requested_resource);
 
-        if in_main || in_ghost {
-            // Get metadata
-            let mut meta = if in_main {
-                let idx = shard.main_cache_map[&requested_resource];
-                shard.entries[idx].1.meta.clone()
+            if in_main || in_ghost {
+                // Get metadata
+                let mut meta = if in_main {
+                    let idx = shard.main_cache_map[&requested_resource];
+                    shard.entries[idx].1.meta.clone()
+                } else {
+                    shard.ghost_cache[&requested_resource].clone()
+                };
+
+                // Time-Decay (Bitwise Shift) and AI-Score Integration
+                let dt = current_time.duration_since(meta.last_accessed).as_secs();
+                let decayed_score = if dt >= 32 {
+                    0.0
+                } else {
+                    meta.score / (1u64 << dt) as f32
+                };
+
+                // Increment value is inversely proportional to AI-Score (request_bot_prob)
+                let new_score = decayed_score + (1.0 - request_bot_prob);
+                
+                meta.last_accessed = current_time;
+                meta.score = new_score;
+
+                // Promotion from Ghost Cache to Main Cache
+                if in_ghost && new_score >= PROMOTION_THRESHOLD {
+                    shard.ghost_cache.insert(requested_resource.clone(), meta); // Temporarily store updated meta
+                    (Action::Promote(meta), None)
+                } else if in_main {
+                    let idx = shard.main_cache_map[&requested_resource];
+                    shard.entries[idx].1.meta = meta;
+                    (Action::Hit, Some(shard.entries[idx].1.payload.clone()))
+                } else {
+                    shard.ghost_cache.insert(requested_resource.clone(), meta);
+                    (Action::GhostHit, None)
+                }
             } else {
-                shard.ghost_cache[&requested_resource].clone()
-            };
+                // Phase 3: Cache Miss (Ghost Cache Insertion)
+                let initial_score = 1.0 - request_bot_prob;
+                shard.ghost_cache.insert(
+                    requested_resource.clone(),
+                    Metadata {
+                        last_accessed: current_time,
+                        score: initial_score,
+                    },
+                );
+                (Action::Miss, None)
+            }
+        };
 
-            // Time-Decay (Bitwise Shift) and AI-Score Integration
-            let dt = current_time.duration_since(meta.last_accessed).as_secs();
-            let decayed_score = if dt >= 32 {
-                0.0
-            } else {
-                meta.score / (1u64 << dt) as f32
-            };
-
-            // Increment value is inversely proportional to AI-Score (request_bot_prob)
-            let new_score = decayed_score + (1.0 - request_bot_prob);
-            
-            meta.last_accessed = current_time;
-            meta.score = new_score;
-
-            // Promotion from Ghost Cache to Main Cache
-            if in_ghost && new_score >= PROMOTION_THRESHOLD {
-                let payload = fetch_from_origin(&requested_resource);
+        match action {
+            Action::Hit => payload.unwrap(),
+            Action::Promote(meta) => {
+                let payload = fetch_from_origin(&requested_resource).await;
+                let mut shard = self.shards[shard_id].lock().unwrap();
+                let current_time = Instant::now();
                 
                 if shard.entries.len() >= shard.capacity {
                     shard.execute_eviction_tournament(current_time);
@@ -196,34 +228,18 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
                 shard.main_cache_map.insert(requested_resource.clone(), idx);
                 shard.ghost_cache.remove(&requested_resource);
                 
-                return payload;
-            }
-
-            // Update metadata and return
-            if in_main {
-                let idx = shard.main_cache_map[&requested_resource];
-                shard.entries[idx].1.meta = meta;
-                return shard.entries[idx].1.payload.clone();
-            } else {
-                shard.ghost_cache.insert(requested_resource.clone(), meta);
-                // In Ghost Cache but not promoted. We still need to serve the user by fetching,
-                // but we do not store the payload in MainCache yet.
-                return fetch_from_origin(&requested_resource);
+                payload
+            },
+            Action::GhostHit | Action::Miss => {
+                fetch_from_origin(&requested_resource).await
             }
         }
-
-        // Phase 3: Cache Miss (Ghost Cache Insertion)
-        // Do not store payload yet to conserve storage space
-        let initial_score = 1.0 - request_bot_prob;
-        shard.ghost_cache.insert(
-            requested_resource.clone(),
-            Metadata {
-                last_accessed: current_time,
-                score: initial_score,
-            },
-        );
-
-        // Return the payload from origin to serve the request
-        fetch_from_origin(&requested_resource)
     }
+}
+
+enum Action {
+    Hit,
+    Promote(Metadata),
+    GhostHit,
+    Miss,
 }

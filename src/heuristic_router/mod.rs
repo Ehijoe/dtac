@@ -13,8 +13,10 @@ use crate::error::Result;
 use score::AiScore;
 use space_saver::SpaceSaver;
 use asn_db::AsnDatabase;
-use tracing::{debug, instrument};
-use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, instrument, info};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use opentelemetry::global;
+use opentelemetry::metrics::{Counter, Histogram};
 
 const BURST_THRESHOLD: f64 = 10.0;
 const ALPHA: f64 = 2.0;
@@ -35,17 +37,25 @@ pub struct HeuristicRouter {
     w_hdr: f64,
     /// Bounded-memory tracker for IP state.
     space_saver: SpaceSaver,
+    
+    // Telemetry
+    eval_requests_counter: Counter<u64>,
+    eval_duration: Histogram<f64>,
 }
 
 impl HeuristicRouter {
     /// Creates a new `HeuristicRouter` with default weights.
     pub fn new() -> Self {
+        let meter = global::meter("dtac");
+        
         Self { 
             l_0: 0.0,
             w_asn: 1.5,
             w_fav: 1.2,
             w_hdr: 1.0,
             space_saver: SpaceSaver::new(10000, 3600), // Default capacity 10000 IPs, 1 hour TTL
+            eval_requests_counter: meter.u64_counter("dtac.router.evaluations").with_description("Number of requests evaluated by heuristic router").init(),
+            eval_duration: meter.f64_histogram("dtac.router.eval_duration").with_description("Time spent evaluating a request in seconds").init(),
         }
     }
 
@@ -62,6 +72,9 @@ impl HeuristicRouter {
     /// Implements the Ingress Proxy Pipeline & Log-Odds AI-Score Generation algorithm.
     #[instrument(skip(self, req))]
     pub async fn evaluate_request(&self, req: &RequestData) -> Result<AiScore> {
+        let start = Instant::now();
+        self.eval_requests_counter.add(1, &[]);
+        
         debug!(ip = %req.ip_address, path = %req.path, "Evaluating incoming request");
 
         let client_ip = req.ip_address;
@@ -97,12 +110,14 @@ impl HeuristicRouter {
         }
 
         // Heuristic B: Infrastructure Origin (Datacenter ASN)
-        if AsnDatabase::is_datacenter(&client_ip) {
+        let is_datacenter = AsnDatabase::is_datacenter(&client_ip);
+        if is_datacenter {
             score += self.w_asn;
         }
 
         // Heuristic C: "Shy Guys" Passive Behavioral Check
-        if ip_state.missing_auxiliary_assets {
+        let missing_assets = ip_state.missing_auxiliary_assets;
+        if missing_assets {
             score += self.w_fav;
         }
 
@@ -116,6 +131,20 @@ impl HeuristicRouter {
 
         // --- PHASE 4: Sigmoid Conversion & Forwarding ---
         let bot_probability = 1.0 / (1.0 + (-score).exp());
+
+        let duration = start.elapsed().as_secs_f64();
+        self.eval_duration.record(duration, &[]);
+        
+        info!(
+            ip = %client_ip,
+            bot_probability = bot_probability,
+            is_datacenter = is_datacenter,
+            missing_assets = missing_assets,
+            has_accept_lang = has_accept_lang,
+            velocity = float_v,
+            duration_sec = duration,
+            "Request evaluated"
+        );
 
         Ok(AiScore::new(bot_probability))
     }

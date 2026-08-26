@@ -2,8 +2,8 @@
 
 use dtac::cache_engine::DtacCacheEngine;
 
-#[test]
-fn test_cache_engine_basic_access() {
+#[tokio::test]
+async fn test_cache_engine_basic_access() {
     let engine = DtacCacheEngine::<String, String>::new(1024);
     let key = "resource_1".to_string();
     
@@ -11,29 +11,29 @@ fn test_cache_engine_basic_access() {
     let result = engine.access(
         key.clone(),
         0.0,
-        |_k| "payload_1".to_string(),
-    );
+        |_k| async { "payload_1".to_string() },
+    ).await;
     assert_eq!(result, "payload_1");
     
     // Second access, score should increase, potentially crossing threshold
     let result2 = engine.access(
         key.clone(),
         0.0,
-        |_k| "payload_1".to_string(),
-    );
+        |_k| async { "payload_1".to_string() },
+    ).await;
     assert_eq!(result2, "payload_1");
     
     // Force a promotion if not already done
     let result3 = engine.access(
         key.clone(),
         0.0,
-        |_k| "payload_1".to_string(),
-    );
+        |_k| async { "payload_1".to_string() },
+    ).await;
     assert_eq!(result3, "payload_1");
 }
 
-#[test]
-fn test_cache_engine_bot_penalty() {
+#[tokio::test]
+async fn test_cache_engine_bot_penalty() {
     let engine = DtacCacheEngine::<String, String>::new(1024);
     let key = "resource_bot".to_string();
     
@@ -41,15 +41,15 @@ fn test_cache_engine_bot_penalty() {
     engine.access(
         key.clone(),
         1.0,
-        |_k| "payload".to_string(),
-    );
+        |_k| async { "payload".to_string() },
+    ).await;
     
     // Keep accessing with 1.0 bot prob, shouldn't easily get promoted
     for _ in 0..5 {
         engine.access(
             key.clone(),
             1.0,
-            |_k| "payload".to_string(),
-        );
+            |_k| async { "payload".to_string() },
+        ).await;
     }
 }

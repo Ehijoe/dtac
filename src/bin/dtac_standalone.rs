@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Request, State},
-    routing::any,
+    routing::{any, get},
     Router,
     response::IntoResponse,
 };
@@ -11,6 +11,8 @@ use dtac::dtac_cache::DtacCache;
 use dtac::types::RequestData;
 use std::sync::Arc;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use prometheus::{Encoder, TextEncoder};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Simple standalone binary running the DTAC cache engine as a proxy.
 #[derive(Parser, Debug, Clone)]
@@ -41,12 +43,7 @@ struct Args {
     port: u16,
 }
 
-#[derive(Clone)]
-struct AppState {
-    cache: Arc<DtacCache<String, bytes::Bytes>>,
-    target: String,
-}
-
+#[axum::debug_handler]
 async fn proxy_handler(State(state): State<AppState>, req: Request) -> impl IntoResponse {
     let path = req.uri().path().to_string();
     let method = req.method().to_string();
@@ -68,12 +65,14 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> impl Into
 
     let target = state.target.clone();
 
-    let fetch_from_origin = |key: &String| -> bytes::Bytes {
+    let fetch_from_origin = |key: &String| {
         let url = format!("{}{}", target, key);
-        let client = reqwest::blocking::Client::new();
-        match client.get(&url).send() {
-            Ok(resp) => resp.bytes().unwrap_or_default(),
-            Err(_) => bytes::Bytes::new(),
+        async move {
+            let client = reqwest::Client::new();
+            match client.get(&url).send().await {
+                Ok(resp) => resp.bytes().await.unwrap_or_default(),
+                Err(_) => bytes::Bytes::new(),
+            }
         }
     };
 
@@ -82,20 +81,57 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> impl Into
     payload
 }
 
+#[derive(Clone)]
+struct AppState {
+    cache: Arc<DtacCache<String, bytes::Bytes>>,
+    target: String,
+    registry: prometheus::Registry,
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let encoder = TextEncoder::new();
+    let mut buffer = vec![];
+    let metric_families = state.registry.gather();
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    String::from_utf8(buffer).unwrap()
+}
+
 #[tokio::main]
 async fn main() {
+    // Initialize tracing
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+        ))
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // Initialize metrics
+    let registry = prometheus::Registry::new();
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .build()
+        .expect("Failed to build prometheus exporter");
+    
+    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_reader(exporter)
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider);
+
     let args = Args::parse();
-    println!("Initializing DTAC Proxy with capacity: {}", args.capacity);
-    println!("Forwarding to target: {}", args.target);
-    println!("Listening on port: {}", args.port);
+    tracing::info!("Initializing DTAC Proxy with capacity: {}", args.capacity);
+    tracing::info!("Forwarding to target: {}", args.target);
+    tracing::info!("Listening on port: {}", args.port);
 
     let cache = Arc::new(DtacCache::new(args.capacity));
     let state = AppState {
         cache,
         target: args.target.clone(),
+        registry,
     };
 
     let app = Router::new()
+        .route("/metrics", get(metrics_handler))
         .fallback(any(proxy_handler))
         .with_state(state);
 
