@@ -28,6 +28,30 @@ BOT_USER_AGENTS = [
     "Mozilla/5.0 (compatible; ScraperBot/1.0; +http://example.com/bot)",
 ]
 
+# Small fixed pool of source IPs simulating a handful of scraper boxes hammering
+# at a mechanical cadence -- this is what the router's per-IP velocity/burst
+# heuristic (BURST_THRESHOLD / ALPHA in src/heuristic_router/mod.rs) is actually
+# designed to catch. Giving every bot request a fresh IP would simulate a
+# distributed botnet that evades that heuristic entirely, defeating the point
+# of threading IPs through the benchmark at all.
+BOT_IP_POOL = [
+    "45.33.12.4", "45.33.12.5", "45.33.12.9",
+    "198.51.100.23", "198.51.100.47", "198.51.100.91",
+    "203.0.113.14", "203.0.113.55", "203.0.113.102",
+    "104.248.33.7", "104.248.33.19", "104.248.33.44",
+    "167.172.9.201", "167.172.9.214",
+]
+
+# First octets to avoid when generating synthetic human IPs, so they don't
+# collide with loopback/link-local/private/reserved ranges.
+_RESERVED_FIRST_OCTETS = {0, 10, 127, 169, 172, 192, 224, 255}
+
+
+def random_public_ipv4() -> str:
+    """Generates a plausible non-reserved IPv4 address (stdlib-only)."""
+    first = random.choice([o for o in range(1, 224) if o not in _RESERVED_FIRST_OCTETS])
+    return f"{first}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(1, 254)}"
+
 
 def precompute_zipf_cdf(n: int, alpha: float) -> np.ndarray:
     """Precomputes normalized cumulative distribution for Zipfian sampling."""
@@ -48,6 +72,10 @@ def generate_human_event(item_id: int, current_timestamp: float) -> list[dict]:
     """Generates a human request followed occasionally by a secondary asset."""
     requests = []
 
+    # One simulated browser session gets one IP, shared across its primary
+    # request and any follow-up asset request.
+    session_ip = random_public_ipv4()
+
     # Primary Document Request
     primary_req = {
         "timestamp": round(current_timestamp, 4),
@@ -60,6 +88,7 @@ def generate_human_event(item_id: int, current_timestamp: float) -> list[dict]:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
         "traffic_type": "human",
+        "ip": session_ip,
     }
     requests.append(primary_req)
 
@@ -76,6 +105,7 @@ def generate_human_event(item_id: int, current_timestamp: float) -> list[dict]:
                 "Referer": f"http://localhost/item/{item_id}",
             },
             "traffic_type": "human",
+            "ip": session_ip,
         }
         requests.append(asset_req)
 
@@ -95,6 +125,7 @@ def generate_bot_event(item_id: int, current_timestamp: float) -> list[dict]:
                 "Accept": "*/*",
             },
             "traffic_type": "bot",
+            "ip": random.choice(BOT_IP_POOL),
         }
     ]
 

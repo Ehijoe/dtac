@@ -133,6 +133,24 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
         (hasher.finish() as usize) % NUM_SHARDS
     }
 
+    /// Returns `(total_entries, total_mapped_keys)` summed across all shards.
+    ///
+    /// Intended for tests/diagnostics only -- it locks every shard sequentially
+    /// and is not meant for use on a hot path. In a consistent cache these two
+    /// numbers are always equal (every `entries` slot is reachable from exactly
+    /// one `main_cache_map` entry); a mismatch indicates an orphaned/leaked
+    /// capacity slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shard's mutex is poisoned (i.e. a previous lock holder panicked).
+    pub fn debug_integrity_counts(&self) -> (usize, usize) {
+        self.shards.iter().fold((0, 0), |(e, m), shard| {
+            let shard = shard.lock().unwrap();
+            (e + shard.entries.len(), m + shard.main_cache_map.len())
+        })
+    }
+
     /// Accesses a resource from the cache, applying the EWMA and Ghost Cache logic.
     ///
     /// # Arguments
@@ -214,12 +232,32 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
             Action::Promote(meta) => {
                 let payload = fetch_from_origin(&requested_resource).await;
                 let mut shard = self.shards[shard_id].lock().unwrap();
+
+                // Another concurrent task may have already promoted this same key
+                // while our fetch_from_origin above was in flight (the shard lock is
+                // dropped for the duration of that await, and the ghost-cache entry
+                // is updated in place rather than removed until a promotion commits,
+                // so every concurrent racer's Phase 1/2 check can independently reach
+                // Action::Promote for the same key). If so, adopt the winner's entry
+                // rather than pushing a second one: a second push+insert would
+                // overwrite main_cache_map's index for this key while leaving the
+                // first-pushed `entries` slot unreachable -- a permanent, leaked
+                // capacity slot that only random eviction sampling could ever clear.
+                // We deliberately discard our own duplicate fetch/meta here rather
+                // than merging them in; the winning entry's score/last_accessed will
+                // be refreshed by the very next ordinary Hit on this (by definition
+                // hot) key, and the extra fetch_from_origin call is accepted as
+                // bounded, non-corrupting wasted work rather than a correctness bug.
+                if let Some(&idx) = shard.main_cache_map.get(&requested_resource) {
+                    return shard.entries[idx].1.payload.clone();
+                }
+
                 let current_time = Instant::now();
-                
+
                 if shard.entries.len() >= shard.capacity {
                     shard.execute_eviction_tournament(current_time);
                 }
-                
+
                 let idx = shard.entries.len();
                 shard.entries.push((requested_resource.clone(), MainCacheEntry {
                     payload: payload.clone(),
@@ -227,7 +265,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
                 }));
                 shard.main_cache_map.insert(requested_resource.clone(), idx);
                 shard.ghost_cache.remove(&requested_resource);
-                
+
                 payload
             },
             Action::GhostHit | Action::Miss => {

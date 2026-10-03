@@ -1,7 +1,7 @@
 //! Standalone binary for running the DTAC cache engine as a proxy.
 
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     routing::{any, get},
     Router,
     response::IntoResponse,
@@ -10,7 +10,7 @@ use clap::Parser;
 use dtac::dtac_cache::DtacCache;
 use dtac::types::RequestData;
 use std::sync::Arc;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use prometheus::{Encoder, TextEncoder};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -43,8 +43,20 @@ struct Args {
     port: u16,
 }
 
+/// Handles a single proxied request.
+///
+/// Uses the direct TCP peer address via `ConnectInfo`. Does not parse
+/// `X-Forwarded-For`/`X-Real-IP`; if DTAC is deployed behind a reverse proxy
+/// or load balancer, the observed IP will be the proxy's, not the end
+/// client's. Supporting forwarded-header parsing is a deliberate non-goal of
+/// this change -- it requires a trusted-proxy allowlist to avoid a
+/// trivially spoofable client IP, which is a separate piece of design work.
 #[axum::debug_handler]
-async fn proxy_handler(State(state): State<AppState>, req: Request) -> impl IntoResponse {
+async fn proxy_handler(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> impl IntoResponse {
     let path = req.uri().path().to_string();
     let method = req.method().to_string();
     let mut headers_map = std::collections::HashMap::new();
@@ -54,8 +66,8 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> impl Into
         }
     }
 
-    let ip_address = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-    
+    let ip_address = addr.ip();
+
     let request_data = RequestData {
         ip_address,
         path: path.clone(),
@@ -137,5 +149,10 @@ async fn main() {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

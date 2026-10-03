@@ -3,7 +3,6 @@
 use clap::Parser;
 use dtac::dtac_cache::DtacCache;
 use dtac::types::RequestData;
-use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use prometheus::{Encoder, TextEncoder};
 use serde::Deserialize;
@@ -14,7 +13,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+use tokio::time::{sleep_until, Instant as TokioInstant};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Direct in-process DTAC Cache log replay benchmark")]
@@ -34,6 +35,22 @@ struct Args {
     /// Simulated payload size in bytes returned on cache miss
     #[arg(short = 's', long, default_value_t = 1024)]
     payload_size: usize,
+
+    /// Playback speed multiplier relative to the recorded timestamps.
+    /// 1.0 = realtime (what the log's timestamps actually encode); higher
+    /// values replay faster. Defaults to a fast constant so existing
+    /// quick-iteration runs stay quick; pass `--speed 1.0` to exercise the
+    /// router's per-IP velocity heuristic against realistic request cadence.
+    #[arg(long, default_value_t = 10_000.0)]
+    speed: f64,
+}
+
+// Only reachable via the `#[serde(default = ...)]` attribute below, which
+// `cargo test --bin` sometimes flags as dead since `main` (the only real
+// caller of `serde_json::from_str::<LogRecord>`) isn't exercised by tests.
+#[allow(dead_code)]
+fn default_ip() -> String {
+    "127.0.0.1".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -44,6 +61,21 @@ struct LogRecord {
     path: String,
     headers: HashMap<String, String>,
     traffic_type: String, // "human" or "bot"
+    #[serde(default = "default_ip")]
+    ip: String,
+}
+
+/// Parses `raw` as an `IpAddr`, falling back to `127.0.0.1` if it's missing
+/// or malformed (e.g. a stale log generated before the `ip` field existed).
+fn resolve_ip(raw: &str) -> IpAddr {
+    raw.parse().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+/// Computes the wall-clock instant at which a record with the given logged
+/// `timestamp` should be dispatched, relative to `bench_start` and scaled by
+/// `speed` (1.0 = realtime, higher = faster).
+fn target_instant(bench_start: TokioInstant, timestamp: f64, speed: f64) -> TokioInstant {
+    bench_start + Duration::from_secs_f64(timestamp / speed)
 }
 
 #[derive(Default)]
@@ -65,6 +97,10 @@ struct BenchMetrics {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.speed <= 0.0 {
+        eprintln!("--speed must be greater than 0.0 (got {})", args.speed);
+        std::process::exit(1);
+    }
 
     // 1. Initialize Prometheus & OpenTelemetry Registry
     let registry = prometheus::Registry::new();
@@ -95,6 +131,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loaded {total_records} records into memory.");
     println!("Cache Capacity: {}", args.capacity);
     println!("Worker Concurrency: {}", args.concurrency);
+    let is_realtime = (args.speed - 1.0).abs() < f64::EPSILON;
+    println!(
+        "Playback Speed: {:.2}x{}",
+        args.speed,
+        if is_realtime { " (realtime)" } else { "" }
+    );
+    if let (Some(first), Some(last)) = (records.first(), records.last()) {
+        let logged_span_secs = (last.timestamp - first.timestamp).max(0.0);
+        println!(
+            "Estimated wall time: {:.1}s ({:.1}s of logged traffic at {:.2}x)",
+            logged_span_secs / args.speed,
+            logged_span_secs,
+            args.speed
+        );
+    }
 
     // 3. Initialize Cache & Metrics Tracker
     let cache = Arc::new(DtacCache::<String, bytes::Bytes>::new(args.capacity));
@@ -109,59 +160,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let start_time = Instant::now();
+    let bench_start = TokioInstant::now();
+    let semaphore = Arc::new(Semaphore::new(args.concurrency));
+    let mut join_set = tokio::task::JoinSet::new();
 
-    // 4. Stream records into the DTAC cache engine directly
-    futures::stream::iter(records)
-        .for_each_concurrent(args.concurrency, |record| {
-            let cache = cache.clone();
-            let metrics = metrics.clone();
-            let pb = pb.clone();
-            let payload = default_payload.clone();
+    // 4. Dispatch records paced by their logged timestamps (scaled by
+    //    --speed), while a semaphore bounds how many may be in flight at
+    //    once -- decoupling "when a request is paced to start" from "how
+    //    many are concurrently executing," matching a real traffic replay.
+    for record in records {
+        sleep_until(target_instant(bench_start, record.timestamp, args.speed)).await;
 
-            async move {
-                let is_bot = record.traffic_type == "bot";
-                
-                // Track total counts per category
-                metrics.total_requests.fetch_add(1, Ordering::Relaxed);
-                if is_bot {
-                    metrics.bot_requests.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    metrics.human_requests.fetch_add(1, Ordering::Relaxed);
-                }
+        // If --speed is set too low for the given --concurrency, this is
+        // where the dispatch loop will stall waiting for a free slot --
+        // intentional backpressure, not a bug.
+        let permit = semaphore.clone().acquire_owned().await.expect("semaphore closed");
+        let cache = cache.clone();
+        let metrics = metrics.clone();
+        let pb = pb.clone();
+        let payload = default_payload.clone();
 
-                let req_data = RequestData {
-                    ip_address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                    path: record.path.clone(),
-                    method: record.method,
-                    headers: record.headers,
-                };
+        join_set.spawn(async move {
+            let _permit = permit; // held for the duration of this task, released on completion
 
-                let path = record.path;
-                let metrics_fetch = metrics.clone();
+            let is_bot = record.traffic_type == "bot";
 
-                // Closure triggered ONLY on a cache miss
-                let fetch_from_origin = |_key: &String| {
-                    let metrics_fetch = metrics_fetch.clone();
-                    let payload = payload.clone();
-                    async move {
-                        metrics_fetch.cache_miss_fetches.fetch_add(1, Ordering::Relaxed);
-                        if is_bot {
-                            metrics_fetch.bot_misses.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            metrics_fetch.human_misses.fetch_add(1, Ordering::Relaxed);
-                        }
-                        payload
-                    }
-                };
-
-                let req_start = Instant::now();
-                let _ = cache.access(path, req_data, fetch_from_origin).await;
-                metrics.total_duration_us.fetch_add(req_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-                pb.inc(1);
+            // Track total counts per category
+            metrics.total_requests.fetch_add(1, Ordering::Relaxed);
+            if is_bot {
+                metrics.bot_requests.fetch_add(1, Ordering::Relaxed);
+            } else {
+                metrics.human_requests.fetch_add(1, Ordering::Relaxed);
             }
-        })
-        .await;
+
+            let req_data = RequestData {
+                ip_address: resolve_ip(&record.ip),
+                path: record.path.clone(),
+                method: record.method,
+                headers: record.headers,
+            };
+
+            let path = record.path;
+            let metrics_fetch = metrics.clone();
+
+            // Closure triggered ONLY on a cache miss
+            let fetch_from_origin = |_key: &String| {
+                let metrics_fetch = metrics_fetch.clone();
+                let payload = payload.clone();
+                async move {
+                    metrics_fetch.cache_miss_fetches.fetch_add(1, Ordering::Relaxed);
+                    if is_bot {
+                        metrics_fetch.bot_misses.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        metrics_fetch.human_misses.fetch_add(1, Ordering::Relaxed);
+                    }
+                    payload
+                }
+            };
+
+            let req_start = Instant::now();
+            let _ = cache.access(path, req_data, fetch_from_origin).await;
+            metrics.total_duration_us.fetch_add(req_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+            pb.inc(1);
+        });
+    }
+
+    // Drain remaining in-flight work after the dispatch loop finishes issuing records.
+    while join_set.join_next().await.is_some() {}
 
     pb.finish_with_message("Replay Complete");
     let total_wall_time = start_time.elapsed();
@@ -174,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_results(
     m: &BenchMetrics,
-    total_time: std::time::Duration,
+    total_time: Duration,
     registry: &prometheus::Registry,
 ) {
     let total_reqs = m.total_requests.load(Ordering::Relaxed);
@@ -224,5 +290,34 @@ fn print_results(
         if let Ok(text) = String::from_utf8(buffer) {
             println!("{}", text);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_ip_parses_valid_address() {
+        assert_eq!(resolve_ip("203.0.113.5"), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
+    }
+
+    #[test]
+    fn resolve_ip_falls_back_on_garbage() {
+        assert_eq!(resolve_ip("not-an-ip"), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn resolve_ip_falls_back_on_missing_default() {
+        assert_eq!(resolve_ip(""), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[tokio::test]
+    async fn target_instant_scales_with_speed() {
+        let start = TokioInstant::now();
+        let at_1x = target_instant(start, 10.0, 1.0);
+        let at_10x = target_instant(start, 10.0, 10.0);
+        assert!(at_10x < at_1x);
+        assert_eq!(at_10x, start + Duration::from_secs_f64(1.0));
     }
 }
