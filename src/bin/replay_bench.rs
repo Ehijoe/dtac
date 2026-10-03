@@ -74,6 +74,24 @@ fn default_ip() -> String {
     "127.0.0.1".to_string()
 }
 
+/// Which part of a replay a record belongs to. Warm-up records populate the
+/// cache exactly like any other access but are excluded from
+/// `BenchMetrics`/timing so the final report reflects steady-state
+/// (post-warm-up) behavior.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Phase {
+    Warmup,
+    Measurement,
+}
+
+// Stale logs generated before the `phase` field existed count fully,
+// matching the tool's original (warm-up-unaware) behavior.
+#[allow(dead_code)]
+const fn default_phase() -> Phase {
+    Phase::Measurement
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
 struct LogRecord {
@@ -84,6 +102,8 @@ struct LogRecord {
     traffic_type: String, // "human" or "bot"
     #[serde(default = "default_ip")]
     ip: String,
+    #[serde(default = "default_phase")]
+    phase: Phase,
 }
 
 /// Parses `raw` as an `IpAddr`, falling back to `127.0.0.1` if it's missing
@@ -238,7 +258,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .progress_chars("#>-"),
     );
 
-    let start_time = Instant::now();
+    let mut start_time = Instant::now();
+    let mut measurement_started = false;
     let bench_start = TokioInstant::now();
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let mut join_set = tokio::task::JoinSet::new();
@@ -249,6 +270,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    many are concurrently executing," matching a real traffic replay.
     for record in records {
         sleep_until(target_instant(bench_start, record.timestamp, args.speed)).await;
+
+        // Warm-up records still exercise the real cache (below) so it gets
+        // populated for whichever --algorithm is selected, but the
+        // metrics-relevant clock only starts once measurement begins, so
+        // throughput/latency/hit-rate numbers reflect a warmed cache, not
+        // the warm-up pass itself.
+        if !measurement_started && record.phase == Phase::Measurement {
+            measurement_started = true;
+            start_time = Instant::now();
+            pb.println("Warm-up complete -- beginning measurement phase.");
+        }
 
         // If --speed is set too low for the given --concurrency, this is
         // where the dispatch loop will stall waiting for a free slot --
@@ -263,13 +295,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _permit = permit; // held for the duration of this task, released on completion
 
             let is_bot = record.traffic_type == "bot";
+            let is_measurement = record.phase == Phase::Measurement;
 
-            // Track total counts per category
-            metrics.total_requests.fetch_add(1, Ordering::Relaxed);
-            if is_bot {
-                metrics.bot_requests.fetch_add(1, Ordering::Relaxed);
-            } else {
-                metrics.human_requests.fetch_add(1, Ordering::Relaxed);
+            // Track total counts per category -- warm-up records still run
+            // through the real cache below, but never touch BenchMetrics.
+            if is_measurement {
+                metrics.total_requests.fetch_add(1, Ordering::Relaxed);
+                if is_bot {
+                    metrics.bot_requests.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    metrics.human_requests.fetch_add(1, Ordering::Relaxed);
+                }
             }
 
             let path = record.path.clone();
@@ -280,11 +316,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let metrics_fetch = metrics_fetch.clone();
                 let payload = payload.clone();
                 async move {
-                    metrics_fetch.cache_miss_fetches.fetch_add(1, Ordering::Relaxed);
-                    if is_bot {
-                        metrics_fetch.bot_misses.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        metrics_fetch.human_misses.fetch_add(1, Ordering::Relaxed);
+                    if is_measurement {
+                        metrics_fetch.cache_miss_fetches.fetch_add(1, Ordering::Relaxed);
+                        if is_bot {
+                            metrics_fetch.bot_misses.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            metrics_fetch.human_misses.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     payload
                 }
@@ -308,7 +346,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Engine::Lru(baseline) => baseline.access(path, fetch_from_origin).await,
             };
-            metrics.total_duration_us.fetch_add(req_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            if is_measurement {
+                metrics.total_duration_us.fetch_add(req_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
 
             pb.inc(1);
         });
@@ -358,18 +398,22 @@ fn print_results(
     };
     println!("\n========================================================");
     println!("          {report_label} DIRECT BENCHMARK REPORT          ");
+    println!("          (post-warm-up, steady-state measurement)        ");
     println!("========================================================");
     println!("Elapsed Time:           {:.3?}", total_time);
     println!("Throughput:             {:.2} ops/sec", rps);
     println!("Average Access Time:    {:.3} µs", avg_latency_us);
     println!("--------------------------------------------------------");
-    println!("Total Requests:         {}", total_reqs);
-    println!("Total Cache Hits:       {} ({:.2}%)", total_hits, overall_hit_rate);
-    println!("Total Cache Misses:     {} ({:.2}%)", total_misses, 100.0 - overall_hit_rate);
-    println!("--------------------------------------------------------");
+    println!("PRIMARY METRIC");
     println!("Human Requests:         {}", human_reqs);
     println!("Human Cache Hit Rate:   {:.2}% ({} hits / {} misses)", human_hit_rate, human_hits, human_misses);
     println!("--------------------------------------------------------");
+    println!("SECONDARY METRIC");
+    println!("Total Requests:         {}", total_reqs);
+    println!("Overall Cache Hit Rate: {} ({:.2}%)", total_hits, overall_hit_rate);
+    println!("Total Cache Misses:     {} ({:.2}%)", total_misses, 100.0 - overall_hit_rate);
+    println!("--------------------------------------------------------");
+    println!("FOR REFERENCE ONLY -- not an optimization target");
     println!("Bot Requests:           {}", bot_reqs);
     println!("Bot Cache Hit Rate:     {:.2}% ({} hits / {} misses)", bot_hit_rate, bot_hits, bot_misses);
     println!("========================================================");
@@ -403,6 +447,23 @@ mod tests {
     #[test]
     fn resolve_ip_falls_back_on_missing_default() {
         assert_eq!(resolve_ip(""), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn phase_defaults_to_measurement_when_absent() -> Result<(), serde_json::Error> {
+        let json = r#"{"timestamp":0.0,"method":"GET","path":"/x","headers":{},"traffic_type":"human"}"#;
+        let record: LogRecord = serde_json::from_str(json)?;
+        assert_eq!(record.phase, Phase::Measurement);
+        Ok(())
+    }
+
+    #[test]
+    fn phase_parses_warmup_and_measurement() -> Result<(), serde_json::Error> {
+        let warmup = r#"{"timestamp":0.0,"method":"GET","path":"/x","headers":{},"traffic_type":"human","phase":"warmup"}"#;
+        let measurement = r#"{"timestamp":0.0,"method":"GET","path":"/x","headers":{},"traffic_type":"human","phase":"measurement"}"#;
+        assert_eq!(serde_json::from_str::<LogRecord>(warmup)?.phase, Phase::Warmup);
+        assert_eq!(serde_json::from_str::<LogRecord>(measurement)?.phase, Phase::Measurement);
+        Ok(())
     }
 
     #[tokio::test]

@@ -10,6 +10,9 @@ import numpy as np
 CATALOG_SIZE = 100_000
 ZIPF_ALPHA = 0.8
 TOTAL_REQUESTS_PER_DATASET = 200_000
+# Number of pure-human warm-up requests prepended to EACH generated dataset
+# (not a single shared file), so the cache reaches a representative steady
+# state before the measurement traffic begins.
 WARMUP_REQUESTS = 50_000
 OUTPUT_DIR = Path("./benchmark_logs")
 
@@ -141,8 +144,31 @@ def generate_dataset(
     total_requests: int,
     bot_ratio: float,
     output_file: Path,
+    warmup_requests: int = WARMUP_REQUESTS,
 ):
-    """Generates a mixed, chronologically interleaved NDJSON log file."""
+    """Generates a phase-tagged, chronologically interleaved NDJSON log file.
+
+    The file opens with a pure-human Zipfian warm-up prefix (phase="warmup",
+    no bots) drawn from the same catalog distribution as the measurement
+    traffic, so the items that will be popular during measurement are
+    already cache-resident by the time measurement begins. The warm-up and
+    measurement streams share one continuous timeline (measurement's clock
+    continues from where warm-up left off), so a replay tool pacing requests
+    by timestamp flows naturally from one phase into the other.
+    """
+    events = []
+
+    # 0. Warm-Up Phase: pure Zipfian human traffic, no bots.
+    warmup_items = sample_zipf(zipf_cdf, warmup_requests)
+    t = 0.0
+    for item_id in warmup_items:
+        inter_arrival = np.random.exponential(scale=0.08)  # Average ~80ms gap
+        t += inter_arrival
+        for event in generate_human_event(int(item_id), t):
+            event["phase"] = "warmup"
+            events.append(event)
+    warmup_end_t = t
+
     num_bot_requests = int(total_requests * bot_ratio)
     num_human_requests = total_requests - num_bot_requests
 
@@ -150,21 +176,25 @@ def generate_dataset(
     human_items = sample_zipf(zipf_cdf, num_human_requests)
     bot_items = np.random.randint(1, CATALOG_SIZE + 1, size=num_bot_requests)
 
-    events = []
-
-    # 1. Human Stream Generation (Bursty Pareto / Exponential delays)
-    t = 0.0
+    # 1. Human Stream Generation (Bursty Pareto / Exponential delays),
+    #    continuing the warm-up clock.
+    t = warmup_end_t
     for item_id in human_items:
         inter_arrival = np.random.exponential(scale=0.08)  # Average ~80ms gap
         t += inter_arrival
-        events.extend(generate_human_event(int(item_id), t))
+        for event in generate_human_event(int(item_id), t):
+            event["phase"] = "measurement"
+            events.append(event)
 
-    # 2. Bot Stream Generation (Highly consistent, mechanical intervals)
-    t = 0.0
+    # 2. Bot Stream Generation (Highly consistent, mechanical intervals),
+    #    also continuing the warm-up clock.
+    t = warmup_end_t
     for item_id in bot_items:
         inter_arrival = random.gauss(0.02, 0.001)  # Fixed ~20ms cadence with low jitter
         t += max(0.001, inter_arrival)
-        events.extend(generate_bot_event(int(item_id), t))
+        for event in generate_bot_event(int(item_id), t):
+            event["phase"] = "measurement"
+            events.append(event)
 
     # 3. Interleave chronologically
     events.sort(key=lambda x: x["timestamp"])
@@ -174,27 +204,24 @@ def generate_dataset(
         for event in events:
             f.write(json.dumps(event) + "\n")
 
+    warmup_count = sum(1 for e in events if e["phase"] == "warmup")
+    measurement_count = len(events) - warmup_count
     print(
         f"Generated {output_file.name} -> {len(events)} total lines "
-        f"(Bot ratio: {bot_ratio * 100:.0f}%)"
+        f"({warmup_count} warm-up + {measurement_count} measurement, "
+        f"bot ratio: {bot_ratio * 100:.0f}%)"
     )
 
 
 def main():
-    """Generates the warmup dataset and all mixed bot-ratio benchmark datasets."""
+    """Generates all mixed bot-ratio benchmark datasets, each with its own warm-up prefix."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Precomputing Zipfian CDF (N={CATALOG_SIZE}, alpha={ZIPF_ALPHA})...")
     zipf_cdf = precompute_zipf_cdf(CATALOG_SIZE, ZIPF_ALPHA)
 
-    # 1. Warm-Up Dataset (Pure Zipfian Human Traffic)
-    generate_dataset(
-        zipf_cdf=zipf_cdf,
-        total_requests=WARMUP_REQUESTS,
-        bot_ratio=0.0,
-        output_file=OUTPUT_DIR / "traffic_warmup.ndjson",
-    )
-
-    # 2. Mixed Workloads (10%, 30%, 50%, 75% Bot Traffic)
+    # Mixed Workloads (10%, 30%, 50%, 75% Bot Traffic), each file opening
+    # with its own pure-human warm-up prefix (phase="warmup") ahead of the
+    # phase="measurement" traffic.
     for ratio in BOT_RATIOS:
         pct = int(ratio * 100)
         filename = OUTPUT_DIR / f"traffic_mixed_{pct}pct_bot.ndjson"
