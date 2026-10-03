@@ -16,8 +16,14 @@ OUTPUT_DIR = Path("./benchmark_logs")
 BOT_RATIOS = [0.10, 0.30, 0.50, 0.75]
 
 HUMAN_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+    ),
     "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
@@ -145,7 +151,7 @@ def generate_dataset(
     bot_items = np.random.randint(1, CATALOG_SIZE + 1, size=num_bot_requests)
 
     events = []
-    
+
     # 1. Human Stream Generation (Bursty Pareto / Exponential delays)
     t = 0.0
     for item_id in human_items:
@@ -168,10 +174,14 @@ def generate_dataset(
         for event in events:
             f.write(json.dumps(event) + "\n")
 
-    print(f"Generated {output_file.name} -> {len(events)} total lines (Bot ratio: {bot_ratio * 100:.0f}%)")
+    print(
+        f"Generated {output_file.name} -> {len(events)} total lines "
+        f"(Bot ratio: {bot_ratio * 100:.0f}%)"
+    )
 
 
 def main():
+    """Generates the warmup dataset and all mixed bot-ratio benchmark datasets."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Precomputing Zipfian CDF (N={CATALOG_SIZE}, alpha={ZIPF_ALPHA})...")
     zipf_cdf = precompute_zipf_cdf(CATALOG_SIZE, ZIPF_ALPHA)

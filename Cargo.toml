@@ -56,3 +56,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 indicatif = "0.18.6"
 futures = "0.3.34"
 serde_json = "1.0.151"
+
+# --- Benchmark-only baseline ---
+# Used only by src/bin/replay_bench.rs to build a standard, bot-unaware
+# sharded LRU cache as a comparison baseline against DTAC's own engine.
+lru = "0.12"

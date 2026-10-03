@@ -1,21 +1,36 @@
 //! Replay script that doesn't make network requests for benchmarking
 
 use clap::Parser;
+use lru::LruCache;
+use dtac::cache_engine::NUM_SHARDS;
 use dtac::dtac_cache::DtacCache;
 use dtac::types::RequestData;
 use indicatif::{ProgressBar, ProgressStyle};
 use prometheus::{Encoder, TextEncoder};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::time::{sleep_until, Instant as TokioInstant};
+
+/// Which caching algorithm `replay_bench` drives the replayed log against.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum Algorithm {
+    /// DTAC's bot-aware randomized-eviction engine (the engine under test).
+    Dtac,
+    /// A standard, bot-unaware sharded LRU cache -- the baseline a
+    /// `--algorithm lru` run is meant to be diffed against.
+    Lru,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Direct in-process DTAC Cache log replay benchmark")]
@@ -43,6 +58,12 @@ struct Args {
     /// router's per-IP velocity heuristic against realistic request cadence.
     #[arg(long, default_value_t = 10_000.0)]
     speed: f64,
+
+    /// Which caching algorithm to replay the log against. Run the tool
+    /// twice, once per value, against the same log file to compare their
+    /// hit rates.
+    #[arg(short = 'a', long, value_enum, default_value_t = Algorithm::Dtac)]
+    algorithm: Algorithm,
 }
 
 // Only reachable via the `#[serde(default = ...)]` attribute below, which
@@ -94,6 +115,60 @@ struct BenchMetrics {
     total_duration_us: AtomicU64,
 }
 
+/// A standard, bot-unaware sharded LRU cache: the baseline that
+/// `--algorithm lru` benchmarks against DTAC's own engine. Shards the same
+/// way as `DtacCacheEngine` (same `NUM_SHARDS`, same capacity-per-shard
+/// math) so the comparison isolates eviction/admission policy rather than
+/// lock granularity or capacity partitioning. Bench-tool-only -- not part
+/// of the published `dtac` library.
+struct BaselineLruEngine<K, P> {
+    shards: Vec<Mutex<LruCache<K, P>>>,
+}
+
+impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
+    fn new(total_capacity: usize) -> Self {
+        let capacity_per_shard = (total_capacity / NUM_SHARDS).max(1);
+        let cap = NonZeroUsize::new(capacity_per_shard).expect("capacity_per_shard is .max(1)'d above, never zero");
+        let shards = (0..NUM_SHARDS).map(|_| Mutex::new(LruCache::new(cap))).collect();
+        Self { shards }
+    }
+
+    fn get_shard_id(key: &K) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % NUM_SHARDS
+    }
+
+    async fn access<F, Fut>(&self, key: K, fetch_from_origin: F) -> P
+    where
+        F: FnOnce(&K) -> Fut,
+        Fut: Future<Output = P>,
+    {
+        let shard_id = Self::get_shard_id(&key);
+
+        let hit = {
+            let mut shard = self.shards[shard_id].lock().expect("baseline LRU shard mutex poisoned");
+            shard.get(&key).cloned() // lru's get() already promotes to MRU
+        };
+        if let Some(payload) = hit {
+            return payload;
+        }
+
+        // Release the lock before awaiting, matching DtacCacheEngine's
+        // convention of never holding a shard lock across an await point.
+        let payload = fetch_from_origin(&key).await;
+        let mut shard = self.shards[shard_id].lock().expect("baseline LRU shard mutex poisoned");
+        shard.put(key, payload.clone()); // idempotent per key: no orphan-entry risk
+        payload
+    }
+}
+
+#[derive(Clone)]
+enum Engine {
+    Dtac(Arc<DtacCache<String, bytes::Bytes>>),
+    Lru(Arc<BaselineLruEngine<String, bytes::Bytes>>),
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -131,6 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loaded {total_records} records into memory.");
     println!("Cache Capacity: {}", args.capacity);
     println!("Worker Concurrency: {}", args.concurrency);
+    println!("Algorithm:              {:?}", args.algorithm);
     let is_realtime = (args.speed - 1.0).abs() < f64::EPSILON;
     println!(
         "Playback Speed: {:.2}x{}",
@@ -148,7 +224,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 3. Initialize Cache & Metrics Tracker
-    let cache = Arc::new(DtacCache::<String, bytes::Bytes>::new(args.capacity));
+    let engine = match args.algorithm {
+        Algorithm::Dtac => Engine::Dtac(Arc::new(DtacCache::<String, bytes::Bytes>::new(args.capacity))),
+        Algorithm::Lru => Engine::Lru(Arc::new(BaselineLruEngine::<String, bytes::Bytes>::new(args.capacity))),
+    };
     let metrics = Arc::new(BenchMetrics::default());
     let default_payload = bytes::Bytes::from(vec![0u8; args.payload_size]);
 
@@ -175,7 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // where the dispatch loop will stall waiting for a free slot --
         // intentional backpressure, not a bug.
         let permit = semaphore.clone().acquire_owned().await.expect("semaphore closed");
-        let cache = cache.clone();
+        let engine = engine.clone();
         let metrics = metrics.clone();
         let pb = pb.clone();
         let payload = default_payload.clone();
@@ -193,14 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 metrics.human_requests.fetch_add(1, Ordering::Relaxed);
             }
 
-            let req_data = RequestData {
-                ip_address: resolve_ip(&record.ip),
-                path: record.path.clone(),
-                method: record.method,
-                headers: record.headers,
-            };
-
-            let path = record.path;
+            let path = record.path.clone();
             let metrics_fetch = metrics.clone();
 
             // Closure triggered ONLY on a cache miss
@@ -219,7 +291,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let req_start = Instant::now();
-            let _ = cache.access(path, req_data, fetch_from_origin).await;
+            let _ = match engine {
+                Engine::Dtac(cache) => {
+                    // RequestData is only built for the Dtac arm -- the Lru
+                    // baseline is bot-unaware by definition, so building it
+                    // there would be pure overhead skewing the two
+                    // algorithms' measured per-request latency against
+                    // each other without affecting hit-rate correctness.
+                    let req_data = RequestData {
+                        ip_address: resolve_ip(&record.ip),
+                        path: record.path,
+                        method: record.method,
+                        headers: record.headers,
+                    };
+                    cache.access(path, req_data, fetch_from_origin).await
+                }
+                Engine::Lru(baseline) => baseline.access(path, fetch_from_origin).await,
+            };
             metrics.total_duration_us.fetch_add(req_start.elapsed().as_micros() as u64, Ordering::Relaxed);
 
             pb.inc(1);
@@ -233,7 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_wall_time = start_time.elapsed();
 
     // 5. Gather and compute final statistics
-    print_results(&metrics, total_wall_time, &registry);
+    print_results(&metrics, total_wall_time, &registry, args.algorithm);
 
     Ok(())
 }
@@ -242,6 +330,7 @@ fn print_results(
     m: &BenchMetrics,
     total_time: Duration,
     registry: &prometheus::Registry,
+    algorithm: Algorithm,
 ) {
     let total_reqs = m.total_requests.load(Ordering::Relaxed);
     let total_misses = m.cache_miss_fetches.load(Ordering::Relaxed);
@@ -263,8 +352,12 @@ fn print_results(
     let human_hit_rate = if human_reqs > 0 { (human_hits as f64 / human_reqs as f64) * 100.0 } else { 0.0 };
     let bot_hit_rate = if bot_reqs > 0 { (bot_hits as f64 / bot_reqs as f64) * 100.0 } else { 0.0 };
 
+    let report_label = match algorithm {
+        Algorithm::Dtac => "DTAC",
+        Algorithm::Lru => "STANDARD LRU (BASELINE)",
+    };
     println!("\n========================================================");
-    println!("              DTAC DIRECT BENCHMARK REPORT              ");
+    println!("          {report_label} DIRECT BENCHMARK REPORT          ");
     println!("========================================================");
     println!("Elapsed Time:           {:.3?}", total_time);
     println!("Throughput:             {:.2} ops/sec", rps);
@@ -319,5 +412,81 @@ mod tests {
         let at_10x = target_instant(start, 10.0, 10.0);
         assert!(at_10x < at_1x);
         assert_eq!(at_10x, start + Duration::from_secs_f64(1.0));
+    }
+
+    #[tokio::test]
+    async fn baseline_lru_hit_after_miss_does_not_refetch() {
+        let engine = BaselineLruEngine::<String, i32>::new(1);
+        let fetches = AtomicU64::new(0);
+
+        let miss = engine
+            .access("only-key".to_string(), |_k| {
+                fetches.fetch_add(1, Ordering::Relaxed);
+                async { 42 }
+            })
+            .await;
+        assert_eq!(miss, 42);
+        assert_eq!(fetches.load(Ordering::Relaxed), 1);
+
+        let hit = engine
+            .access("only-key".to_string(), |_k| {
+                fetches.fetch_add(1, Ordering::Relaxed);
+                async { -1 } // would prove this ran if it did
+            })
+            .await;
+        assert_eq!(hit, 42);
+        assert_eq!(fetches.load(Ordering::Relaxed), 1); // fetch not called again
+    }
+
+    #[tokio::test]
+    async fn baseline_lru_evicts_least_recently_used_within_a_shard() {
+        // DefaultHasher is fixed-seed, so shard assignment is deterministic;
+        // brute-force three candidate keys that collide into the same shard
+        // so recency-ordered (not just capacity-1-swap) eviction is
+        // observable, without depending on shard-count internals beyond
+        // what BaselineLruEngine already exposes.
+        let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
+        for i in 0..5000 {
+            let key = format!("k{i}");
+            let shard = BaselineLruEngine::<String, i32>::get_shard_id(&key);
+            by_shard.entry(shard).or_default().push(key);
+        }
+        let (key_a, key_b, key_c) = by_shard
+            .values()
+            .find(|keys| keys.len() >= 3)
+            .map(|keys| (keys[0].clone(), keys[1].clone(), keys[2].clone()))
+            .expect("5000 candidate keys across 256 shards must collide 3-deep somewhere");
+
+        // total_capacity = 2 * NUM_SHARDS -> capacity_per_shard == 2.
+        let engine = BaselineLruEngine::<String, i32>::new(2 * NUM_SHARDS);
+
+        let _ = engine.access(key_a.clone(), |_k| async { 1 }).await; // shard (MRU->LRU): [A]
+        let _ = engine.access(key_b.clone(), |_k| async { 2 }).await; // shard: [B, A]
+        let _ = engine.access(key_a.clone(), |_k| async { 1 }).await; // hit: promotes A -> shard: [A, B]
+        let _ = engine.access(key_c.clone(), |_k| async { 3 }).await; // miss, over capacity: evicts LRU (B) -> shard: [C, A]
+
+        // Check key_a's survival BEFORE checking key_b: verifying a miss is
+        // itself a cache-mutating access (it re-inserts the key), so
+        // checking key_b first would evict key_a all over again and
+        // invalidate this assertion order.
+        let refetch_a = AtomicU64::new(0);
+        let a_again = engine
+            .access(key_a.clone(), |_k| {
+                refetch_a.fetch_add(1, Ordering::Relaxed);
+                async { 99 }
+            })
+            .await;
+        assert_eq!(a_again, 1); // original value, not 99 -- key_a survived as a hit
+        assert_eq!(refetch_a.load(Ordering::Relaxed), 0);
+
+        let refetch_b = AtomicU64::new(0);
+        let b_again = engine
+            .access(key_b.clone(), |_k| {
+                refetch_b.fetch_add(1, Ordering::Relaxed);
+                async { -1 }
+            })
+            .await;
+        assert_eq!(b_again, -1);
+        assert_eq!(refetch_b.load(Ordering::Relaxed), 1); // confirms key_b was evicted
     }
 }
