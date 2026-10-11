@@ -34,7 +34,7 @@ async fn test_heuristic_router_evaluate_request() {
 }
 
 
-mod asn_lookup {
+mod asn_and_shy_guys {
     #![allow(clippy::unwrap_used)]
 
     use dtac::heuristic_router::HeuristicRouter;
@@ -71,6 +71,15 @@ mod asn_lookup {
 
     async fn score(router: &HeuristicRouter, req: &RequestData) -> f64 {
         router.evaluate_request(req).await.unwrap().value()
+    }
+
+    /// Sends `paths` from `ip_address` in order and returns the last request's score.
+    async fn last_score(router: &HeuristicRouter, ip_address: &str, paths: &[&str]) -> f64 {
+        let mut last = f64::NAN;
+        for path in paths {
+            last = score(router, &human_request(ip_address, path)).await;
+        }
+        last
     }
 
     #[test]
@@ -126,5 +135,24 @@ mod asn_lookup {
         let dc = score(&router, &human_request(DATACENTER_IP, "/item/1")).await;
         let isp = score(&router, &human_request(ISP_IP, "/item/1")).await;
         assert!((dc - isp).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn shy_guys_flags_ips_that_never_fetch_assets() {
+        let router = HeuristicRouter::new();
+        let pages = ["/item/1", "/item/2", "/item/3", "/item/4", "/item/5"];
+
+        // Same request count (6) for A and B, so velocity is equal.
+        let mut with_favicon = vec!["/favicon.ico"];
+        with_favicon.extend(pages);
+        let mut six_pages = pages.to_vec();
+        six_pages.push("/item/6");
+
+        let a = last_score(&router, "10.0.0.1", &with_favicon).await;
+        let b = last_score(&router, "10.0.0.2", &six_pages).await;
+        let under_threshold = last_score(&router, "10.0.0.3", &pages[..4]).await;
+
+        assert!(b > a, "shy IP {b} should exceed favicon IP {a}");
+        assert!((under_threshold - a).abs() < 1e-12, "4 pages must not be flagged");
     }
 }

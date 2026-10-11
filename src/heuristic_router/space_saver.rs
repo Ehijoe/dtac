@@ -13,9 +13,34 @@ pub struct IpState {
     /// EWMA Velocity, stored with 10 fractional bits (i.e. * 1024).
     pub velocity: u32,
     /// Flag indicating whether this IP is suspected of missing auxiliary assets.
+    ///
+    /// Derived from `page_requests` and `has_fetched_asset` by
+    /// [`record_request`](Self::record_request).
     pub missing_auxiliary_assets: bool,
     /// Counter to keep track of how many times the IP has been requested.
     pub count: usize,
+    /// Number of non-asset (page) requests seen from this IP (saturating).
+    pub page_requests: u16,
+    /// Whether this IP has ever fetched an auxiliary asset (favicon, CSS, JS, ...).
+    pub has_fetched_asset: bool,
+}
+
+impl IpState {
+    /// Records one request for the "Shy Guys" heuristic and refreshes
+    /// `missing_auxiliary_assets`.
+    ///
+    /// Browsers fetch auxiliary assets once and then cache them, so the IP is flagged
+    /// only if it has made at least `shy_page_threshold` page requests and has *never*
+    /// fetched an asset.
+    pub const fn record_request(&mut self, is_auxiliary_asset: bool, shy_page_threshold: u16) {
+        if is_auxiliary_asset {
+            self.has_fetched_asset = true;
+        } else {
+            self.page_requests = self.page_requests.saturating_add(1);
+        }
+        self.missing_auxiliary_assets =
+            !self.has_fetched_asset && self.page_requests >= shy_page_threshold;
+    }
 }
 
 #[derive(Debug)]
@@ -201,6 +226,31 @@ impl SpaceSaver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_request_flags_only_after_threshold_pages_without_assets() {
+        let mut state = IpState::default();
+        for _ in 0..4 {
+            state.record_request(false, 5);
+            assert!(!state.missing_auxiliary_assets);
+        }
+        state.record_request(false, 5);
+        assert!(state.missing_auxiliary_assets);
+        assert_eq!(state.page_requests, 5);
+
+        // A single asset fetch clears the flag for good.
+        state.record_request(true, 5);
+        assert!(!state.missing_auxiliary_assets);
+        state.record_request(false, 5);
+        assert!(!state.missing_auxiliary_assets);
+    }
+
+    #[test]
+    fn record_request_page_count_saturates() {
+        let mut state = IpState { page_requests: u16::MAX, ..Default::default() };
+        state.record_request(false, 5);
+        assert_eq!(state.page_requests, u16::MAX);
+    }
 
     #[tokio::test]
     async fn test_space_saver_basic_add_and_update() {

@@ -21,6 +21,17 @@ use opentelemetry::metrics::{Counter, Histogram};
 const BURST_THRESHOLD: f64 = 10.0;
 const ALPHA: f64 = 2.0;
 
+/// Page requests an IP may make without ever fetching an auxiliary asset before the
+/// "Shy Guys" heuristic fires. This is a grace period: a short human visit that never
+/// pulls the favicon (for example because the browser already cached it) must not be
+/// penalized.
+const SHY_PAGE_THRESHOLD: u16 = 5;
+
+/// File extensions treated as auxiliary (non-page) assets by the "Shy Guys" heuristic.
+const AUXILIARY_ASSET_EXTENSIONS: &[&str] = &[
+    "ico", "css", "js", "mjs", "png", "jpg", "jpeg", "gif", "svg", "webp", "avif", "woff", "woff2", "ttf",
+];
+
 /// The main router holding internal state across requests.
 ///
 /// It uses a combination of heuristics and a base weight to determine
@@ -112,6 +123,7 @@ impl HeuristicRouter {
         // Commit updated state back to memory
         ip_state.last_seen = current_time;
         ip_state.velocity = new_velocity;
+        ip_state.record_request(is_auxiliary_asset(&req.path), SHY_PAGE_THRESHOLD);
         self.space_saver.update(client_ip, ip_state.clone()).await;
 
         // --- PHASE 3: Log-Odds Heuristic Evaluation ---
@@ -154,6 +166,7 @@ impl HeuristicRouter {
             bot_probability = bot_probability,
             is_datacenter = is_datacenter,
             missing_assets = missing_assets,
+            page_requests = ip_state.page_requests,
             has_accept_lang = has_accept_lang,
             velocity = float_v,
             duration_sec = duration,
@@ -170,3 +183,49 @@ impl Default for HeuristicRouter {
     }
 }
 
+/// Whether `path` names an auxiliary asset (favicon, stylesheet, script, image, font)
+/// rather than a page, ignoring any `?query` / `#fragment` and letter case.
+fn is_auxiliary_asset(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or_default().to_ascii_lowercase();
+    if path == "/favicon.ico" || path.starts_with("/apple-touch-icon") {
+        return true;
+    }
+    let file_name = path.rsplit('/').next().unwrap_or_default();
+    file_name
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| AUXILIARY_ASSET_EXTENSIONS.contains(&ext))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_auxiliary_asset;
+
+    #[test]
+    fn favicon_and_touch_icons_are_assets() {
+        assert!(is_auxiliary_asset("/favicon.ico"));
+        assert!(is_auxiliary_asset("/apple-touch-icon.png"));
+        assert!(is_auxiliary_asset("/apple-touch-icon-precomposed"));
+    }
+
+    #[test]
+    fn static_extensions_are_assets() {
+        for path in ["/static/site.css", "/app.js", "/m.mjs", "/img/a.WEBP", "/fonts/x.woff2", "/logo.svg"] {
+            assert!(is_auxiliary_asset(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn query_fragment_and_case_are_ignored() {
+        assert!(is_auxiliary_asset("/FAVICON.ICO"));
+        assert!(is_auxiliary_asset("/favicon.ico?v=3"));
+        assert!(is_auxiliary_asset("/style.css#top"));
+        assert!(!is_auxiliary_asset("/item/42?format=.css"));
+    }
+
+    #[test]
+    fn pages_are_not_assets() {
+        for path in ["/", "/item/42", "/api/test", "/about.html", "/v1.2/item", "/favicon.ico.html"] {
+            assert!(!is_auxiliary_asset(path), "{path}");
+        }
+    }
+}
