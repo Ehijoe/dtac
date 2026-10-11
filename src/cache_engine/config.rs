@@ -1,6 +1,6 @@
 //! Tunable constants of the cache engine.
 
-use super::{N_SAMPLES, PROMOTION_THRESHOLD};
+use super::{GHOST_CAPACITY_MULTIPLIER, N_SAMPLES, PROMOTION_THRESHOLD};
 use crate::error::{DTACError, Result};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +26,8 @@ pub struct EngineConfig {
     pub promotion_threshold: f32,
     /// Number of random entries sampled in each eviction tournament.
     pub n_samples: usize,
+    /// Ghost-cache capacity per shard, as a multiple of the main-cache capacity per shard.
+    pub ghost_multiplier: usize,
 }
 
 impl Default for EngineConfig {
@@ -35,6 +37,7 @@ impl Default for EngineConfig {
             decay_cutoff_half_lives: 32,
             promotion_threshold: PROMOTION_THRESHOLD,
             n_samples: N_SAMPLES,
+            ghost_multiplier: GHOST_CAPACITY_MULTIPLIER,
         }
     }
 }
@@ -55,6 +58,9 @@ impl EngineConfig {
         }
         if self.n_samples == 0 {
             return invalid("n_samples must be at least 1".to_string());
+        }
+        if self.ghost_multiplier == 0 {
+            return invalid("ghost_multiplier must be at least 1".to_string());
         }
         Ok(())
     }
@@ -84,6 +90,10 @@ mod tests {
             },
             EngineConfig {
                 n_samples: 0,
+                ..Default::default()
+            },
+            EngineConfig {
+                ghost_multiplier: 0,
                 ..Default::default()
             },
         ] {

@@ -105,6 +105,15 @@ async fn test_cache_engine_concurrent_promotion_no_orphans() {
         total_entries, total_mapped,
         "orphaned cache entry detected: entries={total_entries}, mapped_keys={total_mapped}"
     );
+
+    for (entries, mapped) in engine.debug_ghost_counts() {
+        assert_eq!(entries, mapped, "orphaned ghost entry detected");
+    }
+    assert_eq!(
+        engine.ghost_len(),
+        0,
+        "the promoted key must leave the ghost cache"
+    );
 }
 
 /// Engine behaviour driven by an injected [`ManualClock`] and a custom [`EngineConfig`].
@@ -196,4 +205,23 @@ mod configured {
         let clock = Arc::new(ManualClock::default());
         assert!(DtacCacheEngine::<String, String>::with_config(1024, config, clock).is_err());
     }
+}
+
+#[tokio::test]
+async fn ghost_cache_stays_bounded_under_a_unique_key_scan() {
+    let engine = DtacCacheEngine::<String, ()>::new(1024);
+    let bound = engine.ghost_capacity_per_shard();
+    assert_eq!(bound, 4 * 4, "1024 / 256 shards * default multiplier 4");
+
+    for i in 0..100_000 {
+        engine.access(format!("scan-{i}"), 0.5, |_k| async {}).await;
+    }
+
+    for (shard, (entries, mapped)) in engine.debug_ghost_counts().into_iter().enumerate() {
+        assert_eq!(entries, mapped, "ghost index mismatch in shard {shard}");
+        assert!(entries <= bound, "shard {shard} holds {entries} > {bound}");
+    }
+    assert!(engine.ghost_len() <= bound * dtac::cache_engine::NUM_SHARDS);
+    let (total_entries, total_mapped) = engine.debug_integrity_counts();
+    assert_eq!(total_entries, total_mapped);
 }

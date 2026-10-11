@@ -25,6 +25,10 @@ pub const N_SAMPLES: usize = 5;
 /// ([`EngineConfig::promotion_threshold`]).
 pub const PROMOTION_THRESHOLD: f32 = 2.0;
 
+/// Default ghost-cache capacity per shard, as a multiple of the main-cache capacity per
+/// shard ([`EngineConfig::ghost_multiplier`]).
+pub const GHOST_CAPACITY_MULTIPLIER: usize = 4;
+
 /// Metadata for a cached resource, tracking access time and EWMA score.
 #[derive(Clone, Copy, Debug)]
 pub struct Metadata {
@@ -124,20 +128,56 @@ pub struct CacheShard<K, P> {
     main_cache_map: HashMap<K, usize>,
     /// Dense storage of main cache entries for O(1) random sampling during eviction.
     entries: Vec<(K, MainCacheEntry<P>)>,
-    /// Metadata-only ghost cache for cold-start mitigation.
-    ghost_cache: HashMap<K, Metadata>,
+    /// Maps a ghost-cache key to its index in the `ghost_entries` vector.
+    ghost_map: HashMap<K, usize>,
+    /// Dense, metadata-only ghost cache for cold-start mitigation, bounded by
+    /// `ghost_capacity` and evicted with the same tournament as the main cache.
+    ghost_entries: Vec<(K, Metadata)>,
     /// The maximum number of items allowed in the main cache for this shard.
     capacity: usize,
+    /// The maximum number of items allowed in the ghost cache for this shard.
+    ghost_capacity: usize,
 }
 
 impl<K: Eq + Hash + Clone, P: Clone> CacheShard<K, P> {
-    /// Creates a new cache shard with the specified capacity.
+    /// Creates a new cache shard with the specified capacity and a ghost cache of
+    /// [`GHOST_CAPACITY_MULTIPLIER`] times that.
     pub fn new(capacity: usize) -> Self {
+        Self::with_ghost_capacity(capacity, capacity * GHOST_CAPACITY_MULTIPLIER)
+    }
+
+    /// Creates a new cache shard with explicit main- and ghost-cache capacities.
+    pub fn with_ghost_capacity(capacity: usize, ghost_capacity: usize) -> Self {
         Self {
             main_cache_map: HashMap::new(),
             entries: Vec::with_capacity(capacity),
-            ghost_cache: HashMap::new(),
+            ghost_map: HashMap::new(),
+            ghost_entries: Vec::new(),
             capacity,
+            ghost_capacity: ghost_capacity.max(1),
+        }
+    }
+
+    /// Inserts a new ghost-cache entry, first evicting one by tournament if the ghost
+    /// cache is full.
+    ///
+    /// Bot-inserted entries start with a score near 0, so they lose these tournaments
+    /// before entries that humans have requested.
+    fn insert_ghost(&mut self, key: K, meta: Metadata, now_ms: u64, config: &EngineConfig) {
+        if self.ghost_entries.len() >= self.ghost_capacity
+            && let Some(idx) =
+                tournament_victim(&self.ghost_entries, now_ms, config, &mut rand::thread_rng())
+        {
+            swap_remove_indexed(&mut self.ghost_map, &mut self.ghost_entries, idx);
+        }
+        self.ghost_map.insert(key.clone(), self.ghost_entries.len());
+        self.ghost_entries.push((key, meta));
+    }
+
+    /// Removes `key` from the ghost cache if present (it may already have been evicted).
+    fn remove_ghost(&mut self, key: &K) {
+        if let Some(&idx) = self.ghost_map.get(key) {
+            swap_remove_indexed(&mut self.ghost_map, &mut self.ghost_entries, idx);
         }
     }
 
@@ -156,6 +196,7 @@ impl<K: Eq + Hash + Clone, P: Clone> CacheShard<K, P> {
 #[derive(Debug)]
 pub struct DtacCacheEngine<K, P> {
     shards: Vec<Mutex<CacheShard<K, P>>>,
+    ghost_capacity_per_shard: usize,
     config: EngineConfig,
     clock: Arc<dyn Clock>,
 }
@@ -189,12 +230,17 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     /// Shared constructor; `config` must already be valid.
     fn build(total_capacity: usize, config: EngineConfig, clock: Arc<dyn Clock>) -> Self {
         let capacity_per_shard = (total_capacity / NUM_SHARDS).max(1);
+        let ghost_capacity_per_shard = capacity_per_shard * config.ghost_multiplier;
         let mut shards = Vec::with_capacity(NUM_SHARDS);
         for _ in 0..NUM_SHARDS {
-            shards.push(Mutex::new(CacheShard::new(capacity_per_shard)));
+            shards.push(Mutex::new(CacheShard::with_ghost_capacity(
+                capacity_per_shard,
+                ghost_capacity_per_shard,
+            )));
         }
         Self {
             shards,
+            ghost_capacity_per_shard,
             config,
             clock,
         }
@@ -208,6 +254,49 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     /// The clock this engine reads time from.
     pub const fn clock(&self) -> &Arc<dyn Clock> {
         &self.clock
+    }
+
+    /// The maximum number of ghost-cache entries each shard holds.
+    pub const fn ghost_capacity_per_shard(&self) -> usize {
+        self.ghost_capacity_per_shard
+    }
+
+    /// The number of resources currently in the main cache, across all shards.
+    ///
+    /// Locks every shard in turn, so it is meant for reporting, not for hot paths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shard's mutex is poisoned (i.e. a previous lock holder panicked).
+    pub fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().unwrap().entries.len())
+            .sum()
+    }
+
+    /// Whether the main cache is empty. See [`len`](Self::len).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shard's mutex is poisoned (i.e. a previous lock holder panicked).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The number of metadata-only ghost-cache entries, across all shards.
+    ///
+    /// Reported next to hit rates to show the engine's metadata overhead. Locks every
+    /// shard in turn, so it is meant for reporting, not for hot paths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shard's mutex is poisoned (i.e. a previous lock holder panicked).
+    pub fn ghost_len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().unwrap().ghost_entries.len())
+            .sum()
     }
 
     /// Hashes the requested resource to determine its specific concurrency bucket.
@@ -235,6 +324,24 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
         })
     }
 
+    /// Returns `(ghost_entries, ghost_mapped_keys)` for each shard.
+    ///
+    /// Intended for tests/diagnostics only. In a consistent cache the two numbers are
+    /// equal and at most [`ghost_capacity_per_shard`](Self::ghost_capacity_per_shard).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shard's mutex is poisoned (i.e. a previous lock holder panicked).
+    pub fn debug_ghost_counts(&self) -> Vec<(usize, usize)> {
+        self.shards
+            .iter()
+            .map(|shard| {
+                let shard = shard.lock().unwrap();
+                (shard.ghost_entries.len(), shard.ghost_map.len())
+            })
+            .collect()
+    }
+
     /// The current decayed score of `resource` if it is in the main or ghost cache.
     ///
     /// Intended for tests/diagnostics only.
@@ -245,7 +352,12 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     pub fn debug_score(&self, resource: &K) -> Option<f32> {
         let shard = self.shards[Self::get_shard_id(resource)].lock().unwrap();
         let meta = shard.main_cache_map.get(resource).map_or_else(
-            || shard.ghost_cache.get(resource).copied(),
+            || {
+                shard
+                    .ghost_map
+                    .get(resource)
+                    .map(|&idx| shard.ghost_entries[idx].1)
+            },
             |&idx| Some(shard.entries[idx].1.meta),
         )?;
         drop(shard);
@@ -276,16 +388,22 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
             let current_time = self.clock.now_millis();
 
             // Phase 2: Cache Hit Evaluation & Score Update
-            let in_main = shard.main_cache_map.contains_key(&requested_resource);
-            let in_ghost = shard.ghost_cache.contains_key(&requested_resource);
+            let slot = shard
+                .main_cache_map
+                .get(&requested_resource)
+                .map(|&idx| Slot::Main(idx))
+                .or_else(|| {
+                    shard
+                        .ghost_map
+                        .get(&requested_resource)
+                        .map(|&idx| Slot::Ghost(idx))
+                });
 
-            if in_main || in_ghost {
+            if let Some(slot) = slot {
                 // Get metadata
-                let mut meta = if in_main {
-                    let idx = shard.main_cache_map[&requested_resource];
-                    shard.entries[idx].1.meta.clone()
-                } else {
-                    shard.ghost_cache[&requested_resource].clone()
+                let mut meta = match slot {
+                    Slot::Main(idx) => shard.entries[idx].1.meta,
+                    Slot::Ghost(idx) => shard.ghost_entries[idx].1,
                 };
 
                 // Time-Decay (Bitwise Shift) and AI-Score Integration
@@ -297,27 +415,34 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
                 meta.last_accessed = current_time;
                 meta.score = new_score;
 
-                // Promotion from Ghost Cache to Main Cache
-                if in_ghost && new_score >= self.config.promotion_threshold {
-                    shard.ghost_cache.insert(requested_resource.clone(), meta); // Temporarily store updated meta
-                    (Action::Promote(meta), None)
-                } else if in_main {
-                    let idx = shard.main_cache_map[&requested_resource];
-                    shard.entries[idx].1.meta = meta;
-                    (Action::Hit, Some(shard.entries[idx].1.payload.clone()))
-                } else {
-                    shard.ghost_cache.insert(requested_resource.clone(), meta);
-                    (Action::GhostHit, None)
+                match slot {
+                    Slot::Main(idx) => {
+                        shard.entries[idx].1.meta = meta;
+                        (Action::Hit, Some(shard.entries[idx].1.payload.clone()))
+                    }
+                    Slot::Ghost(idx) => {
+                        // Store the updated meta in place; on promotion the ghost entry
+                        // is only removed once the promotion commits.
+                        shard.ghost_entries[idx].1 = meta;
+                        // Promotion from Ghost Cache to Main Cache
+                        if new_score >= self.config.promotion_threshold {
+                            (Action::Promote(meta), None)
+                        } else {
+                            (Action::GhostHit, None)
+                        }
+                    }
                 }
             } else {
                 // Phase 3: Cache Miss (Ghost Cache Insertion)
                 let initial_score = 1.0 - request_bot_prob;
-                shard.ghost_cache.insert(
+                shard.insert_ghost(
                     requested_resource.clone(),
                     Metadata {
                         last_accessed: current_time,
                         score: initial_score,
                     },
+                    current_time,
+                    &self.config,
                 );
                 (Action::Miss, None)
             }
@@ -361,13 +486,24 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
                     },
                 ));
                 shard.main_cache_map.insert(requested_resource.clone(), idx);
-                shard.ghost_cache.remove(&requested_resource);
+                // The ghost entry may already have been evicted while the fetch was in
+                // flight; removal is a no-op then.
+                shard.remove_ghost(&requested_resource);
 
                 payload
             }
             Action::GhostHit | Action::Miss => fetch_from_origin(&requested_resource).await,
         }
     }
+}
+
+/// Where a resource currently lives within its shard.
+#[derive(Clone, Copy)]
+enum Slot {
+    /// Index into the shard's main-cache `entries`.
+    Main(usize),
+    /// Index into the shard's `ghost_entries`.
+    Ghost(usize),
 }
 
 enum Action {
@@ -480,6 +616,44 @@ mod tests {
             tournament_victim(&entries, 0, &exhaustive(), &mut rng()),
             None
         );
+    }
+
+    /// `count` distinct keys that all hash to shard 0.
+    fn keys_in_shard_zero(count: usize) -> Vec<String> {
+        (0..)
+            .map(|i| format!("k{i}"))
+            .filter(|k| DtacCacheEngine::<String, ()>::get_shard_id(k) == 0)
+            .take(count)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn bot_scored_ghost_entries_are_evicted_before_human_ones() {
+        // One main slot and four ghost slots per shard; sample widely so the tournament
+        // almost surely sees every ghost entry.
+        let clock = Arc::new(crate::clock::ManualClock::new(0));
+        let config = EngineConfig {
+            n_samples: 64,
+            ..Default::default()
+        };
+        let engine = DtacCacheEngine::<String, ()>::with_config(NUM_SHARDS, config, clock).unwrap();
+        assert_eq!(engine.ghost_capacity_per_shard(), 4);
+
+        let keys = keys_in_shard_zero(22);
+        let (humans, bots) = keys.split_at(2);
+        for key in humans {
+            engine.access(key.clone(), 0.0, |_k| async {}).await;
+        }
+        // Twenty bot scans churn through the two remaining ghost slots.
+        for key in bots {
+            engine.access(key.clone(), 1.0, |_k| async {}).await;
+        }
+
+        for key in humans {
+            let score = engine.debug_score(key);
+            assert_eq!(score, Some(1.0), "human ghost entry {key} was evicted");
+        }
+        assert_eq!(engine.debug_ghost_counts()[0], (4, 4));
     }
 
     #[test]
