@@ -32,10 +32,9 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - uses: Swatinem/rust-cache@v2
-      # Fails on clippy errors (incl. deny-by-default correctness lints). The
-      # pedantic/nursery/cargo groups enabled in Cargo.toml stay warnings for now
-      # because of pre-existing violations; add `-- -D warnings` once those are fixed.
-      - run: cargo clippy --all-targets --locked
+      # Fails on any warning, including the pedantic/nursery/cargo groups
+      # enabled in Cargo.toml.
+      - run: cargo clippy --all-targets --locked -- -D warnings
 
   python-test:
     name: Log generator tests

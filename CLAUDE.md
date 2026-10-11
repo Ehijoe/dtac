@@ -52,9 +52,10 @@ tests live inline in `#[cfg(test)]` modules within the source files they test (e
 
 `Cargo.toml` turns on `clippy::pedantic`, `clippy::nursery`, and `clippy::cargo` as warnings, plus
 `unsafe_code = "forbid"` and `missing_docs = "warn"`. New public items need doc comments;
-`unwrap()`/`expect()` are warned on (`clippy::unwrap_used`, `clippy::expect_used`) — existing code
-has some pre-existing violations (e.g. mutex locks, `tokio::net::TcpListener::bind(...).await.unwrap()`
-in the standalone binary) that are not yet cleaned up.
+`unwrap()`/`expect()` are warned on (`clippy::unwrap_used`, `clippy::expect_used`) outside tests
+(`clippy.toml` allows them in test code). The tree is warning-free and CI runs clippy with
+`-D warnings`, so any new warning fails the build: lock mutexes with `crate::sync::lock`, propagate
+errors with `?` in the binaries, and put a justifying comment on any `#[allow(...)]`.
 
 ### Running the standalone proxy
 
