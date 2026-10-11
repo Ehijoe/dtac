@@ -3,29 +3,109 @@
 //! This module provides the core caching engine that manages cache entries
 //! dynamically based on traffic patterns and heuristic AI scoring.
 
+pub mod config;
+
+use crate::clock::{Clock, SystemClock};
+use crate::error::Result;
+use config::EngineConfig;
 use rand::Rng;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 
 /// The number of independent mutex locks used for lock sharding.
 pub const NUM_SHARDS: usize = 256;
 
-/// The number of random items selected during an eviction tournament.
+/// Default number of random items selected during an eviction tournament
+/// ([`EngineConfig::n_samples`]).
 pub const N_SAMPLES: usize = 5;
 
-/// The score threshold required to promote an item from Ghost Cache to Main Cache.
+/// Default score threshold required to promote an item from Ghost Cache to Main Cache
+/// ([`EngineConfig::promotion_threshold`]).
 pub const PROMOTION_THRESHOLD: f32 = 2.0;
 
 /// Metadata for a cached resource, tracking access time and EWMA score.
 #[derive(Clone, Copy, Debug)]
 pub struct Metadata {
-    /// The last time this resource was accessed.
-    pub last_accessed: Instant,
-    /// The current EWMA popularity score.
+    /// The last time this resource was accessed, in milliseconds on the engine's clock.
+    pub last_accessed: u64,
+    /// The EWMA popularity score as of `last_accessed`.
     pub score: f32,
+}
+
+impl Metadata {
+    /// The score decayed to `now_ms`: halved once per whole `decay_half_life_ms` elapsed
+    /// since `last_accessed`, and 0 after `decay_cutoff_half_lives`.
+    pub fn decayed_score(&self, now_ms: u64, config: &EngineConfig) -> f32 {
+        let half_lives = now_ms.saturating_sub(self.last_accessed) / config.decay_half_life_ms;
+        if half_lives >= u64::from(config.decay_cutoff_half_lives) {
+            return 0.0;
+        }
+        // Multiplying by a power of two is exact, like the original `score / (1 << dt)`.
+        i32::try_from(half_lives).map_or(0.0, |n| self.score * 0.5_f32.powi(n))
+    }
+}
+
+/// Anything stored in a tournament-evicted dense vector that carries [`Metadata`].
+trait HasMeta {
+    fn meta(&self) -> &Metadata;
+}
+
+impl HasMeta for Metadata {
+    fn meta(&self) -> &Metadata {
+        self
+    }
+}
+
+impl<P> HasMeta for MainCacheEntry<P> {
+    fn meta(&self) -> &Metadata {
+        &self.meta
+    }
+}
+
+/// Runs a randomized eviction tournament (Algorithm 2) over `entries` and returns the
+/// index of the victim, or `None` if `entries` is empty.
+///
+/// Samples `config.n_samples` random entries (with replacement) and picks the one with
+/// the lowest decayed score. Ties, which are common once scores have decayed to 0, go
+/// to the entry with the oldest `last_accessed`, so they fall back to LRU order instead
+/// of to whichever entry happened to be sampled first.
+fn tournament_victim<K, M: HasMeta>(
+    entries: &[(K, M)],
+    now_ms: u64,
+    config: &EngineConfig,
+    rng: &mut impl Rng,
+) -> Option<usize> {
+    if entries.is_empty() {
+        return None;
+    }
+    let rank = |idx: usize| {
+        let meta = entries[idx].1.meta();
+        (meta.decayed_score(now_ms, config), meta.last_accessed)
+    };
+    (0..config.n_samples)
+        .map(|_| rng.gen_range(0..entries.len()))
+        .min_by(|&a, &b| {
+            let (score_a, time_a) = rank(a);
+            let (score_b, time_b) = rank(b);
+            score_a.total_cmp(&score_b).then(time_a.cmp(&time_b))
+        })
+}
+
+/// Removes `entries[idx]` in O(1) with `swap_remove`, keeping the key → index `map`
+/// consistent: the removed key is unmapped and the entry moved into `idx` is re-pointed.
+fn swap_remove_indexed<K: Eq + Hash + Clone, V>(
+    map: &mut HashMap<K, usize>,
+    entries: &mut Vec<(K, V)>,
+    idx: usize,
+) -> (K, V) {
+    let removed = entries.swap_remove(idx);
+    map.remove(&removed.0);
+    if let Some((moved_key, _)) = entries.get(idx) {
+        map.insert(moved_key.clone(), idx);
+    }
+    removed
 }
 
 /// An entry in the Main Cache containing both payload and metadata.
@@ -61,47 +141,11 @@ impl<K: Eq + Hash + Clone, P: Clone> CacheShard<K, P> {
         }
     }
 
-    /// Executes the randomized eviction tournament (Algorithm 2).
-    fn execute_eviction_tournament(&mut self, current_time: Instant) {
-        if self.entries.is_empty() {
-            return;
-        }
-
-        let mut rng = rand::thread_rng();
-        let mut min_score = f32::INFINITY;
-        let mut eviction_target_idx = 0;
-
-        // Sample N random items and find the one with the lowest decayed score
-        for _ in 0..N_SAMPLES {
-            let idx = rng.gen_range(0..self.entries.len());
-            let (_, entry) = &self.entries[idx];
-
-            let dt = current_time
-                .duration_since(entry.meta.last_accessed)
-                .as_secs();
-
-            // Time-Decay (Bitwise Shift approximation for floats)
-            // If delta time is large enough, score naturally decays toward zero.
-            let current_decayed_score = if dt >= 32 {
-                0.0
-            } else {
-                entry.meta.score / (1u64 << dt) as f32
-            };
-
-            if current_decayed_score < min_score {
-                min_score = current_decayed_score;
-                eviction_target_idx = idx;
-            }
-        }
-
-        // Evict the target item in O(1) time using swap_remove
-        let (evicted_key, _) = self.entries.swap_remove(eviction_target_idx);
-        self.main_cache_map.remove(&evicted_key);
-
-        // If swap_remove moved the last element to the evicted index, update its map entry
-        if eviction_target_idx < self.entries.len() {
-            let moved_key = self.entries[eviction_target_idx].0.clone();
-            self.main_cache_map.insert(moved_key, eviction_target_idx);
+    /// Evicts one main-cache entry chosen by [`tournament_victim`].
+    fn execute_eviction_tournament(&mut self, now_ms: u64, config: &EngineConfig) {
+        if let Some(idx) = tournament_victim(&self.entries, now_ms, config, &mut rand::thread_rng())
+        {
+            swap_remove_indexed(&mut self.main_cache_map, &mut self.entries, idx);
         }
     }
 }
@@ -112,18 +156,58 @@ impl<K: Eq + Hash + Clone, P: Clone> CacheShard<K, P> {
 #[derive(Debug)]
 pub struct DtacCacheEngine<K, P> {
     shards: Vec<Mutex<CacheShard<K, P>>>,
+    config: EngineConfig,
+    clock: Arc<dyn Clock>,
 }
 
 impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     /// Creates a new DTAC Engine with the specified total capacity.
     /// The capacity is divided evenly among all shards.
+    ///
+    /// Uses the default [`EngineConfig`] and the system clock.
     pub fn new(total_capacity: usize) -> Self {
+        Self::build(
+            total_capacity,
+            EngineConfig::default(),
+            SystemClock::shared(),
+        )
+    }
+
+    /// Creates an engine with a custom [`EngineConfig`] that reads time from `clock`.
+    ///
+    /// Fails with [`DTACError::ConfigError`](crate::error::DTACError::ConfigError) if
+    /// `config` does not pass [`EngineConfig::validate`].
+    pub fn with_config(
+        total_capacity: usize,
+        config: EngineConfig,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
+        config.validate()?;
+        Ok(Self::build(total_capacity, config, clock))
+    }
+
+    /// Shared constructor; `config` must already be valid.
+    fn build(total_capacity: usize, config: EngineConfig, clock: Arc<dyn Clock>) -> Self {
         let capacity_per_shard = (total_capacity / NUM_SHARDS).max(1);
         let mut shards = Vec::with_capacity(NUM_SHARDS);
         for _ in 0..NUM_SHARDS {
             shards.push(Mutex::new(CacheShard::new(capacity_per_shard)));
         }
-        Self { shards }
+        Self {
+            shards,
+            config,
+            clock,
+        }
+    }
+
+    /// The configuration this engine runs with.
+    pub const fn config(&self) -> &EngineConfig {
+        &self.config
+    }
+
+    /// The clock this engine reads time from.
+    pub const fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
     }
 
     /// Hashes the requested resource to determine its specific concurrency bucket.
@@ -151,6 +235,23 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
         })
     }
 
+    /// The current decayed score of `resource` if it is in the main or ghost cache.
+    ///
+    /// Intended for tests/diagnostics only.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shard's mutex is poisoned (i.e. a previous lock holder panicked).
+    pub fn debug_score(&self, resource: &K) -> Option<f32> {
+        let shard = self.shards[Self::get_shard_id(resource)].lock().unwrap();
+        let meta = shard.main_cache_map.get(resource).map_or_else(
+            || shard.ghost_cache.get(resource).copied(),
+            |&idx| Some(shard.entries[idx].1.meta),
+        )?;
+        drop(shard);
+        Some(meta.decayed_score(self.clock.now_millis(), &self.config))
+    }
+
     /// Accesses a resource from the cache, applying the EWMA and Ghost Cache logic.
     ///
     /// # Arguments
@@ -172,7 +273,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
 
         let (action, payload) = {
             let mut shard = self.shards[shard_id].lock().unwrap();
-            let current_time = Instant::now();
+            let current_time = self.clock.now_millis();
 
             // Phase 2: Cache Hit Evaluation & Score Update
             let in_main = shard.main_cache_map.contains_key(&requested_resource);
@@ -188,12 +289,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
                 };
 
                 // Time-Decay (Bitwise Shift) and AI-Score Integration
-                let dt = current_time.duration_since(meta.last_accessed).as_secs();
-                let decayed_score = if dt >= 32 {
-                    0.0
-                } else {
-                    meta.score / (1u64 << dt) as f32
-                };
+                let decayed_score = meta.decayed_score(current_time, &self.config);
 
                 // Increment value is inversely proportional to AI-Score (request_bot_prob)
                 let new_score = decayed_score + (1.0 - request_bot_prob);
@@ -202,7 +298,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
                 meta.score = new_score;
 
                 // Promotion from Ghost Cache to Main Cache
-                if in_ghost && new_score >= PROMOTION_THRESHOLD {
+                if in_ghost && new_score >= self.config.promotion_threshold {
                     shard.ghost_cache.insert(requested_resource.clone(), meta); // Temporarily store updated meta
                     (Action::Promote(meta), None)
                 } else if in_main {
@@ -252,10 +348,8 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
                     return shard.entries[idx].1.payload.clone();
                 }
 
-                let current_time = Instant::now();
-
                 if shard.entries.len() >= shard.capacity {
-                    shard.execute_eviction_tournament(current_time);
+                    shard.execute_eviction_tournament(self.clock.now_millis(), &self.config);
                 }
 
                 let idx = shard.entries.len();
@@ -281,4 +375,124 @@ enum Action {
     Promote(Metadata),
     GhostHit,
     Miss,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    fn meta(score: f32, last_accessed: u64) -> Metadata {
+        Metadata {
+            last_accessed,
+            score,
+        }
+    }
+
+    fn rng() -> StdRng {
+        StdRng::seed_from_u64(0x00D7_AC00)
+    }
+
+    /// Enough samples that every entry of a small slice is almost surely drawn.
+    fn exhaustive() -> EngineConfig {
+        EngineConfig {
+            n_samples: 256,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decayed_score_halves_per_half_life_and_cuts_off() {
+        let cfg = EngineConfig {
+            decay_half_life_ms: 10_000,
+            decay_cutoff_half_lives: 3,
+            ..Default::default()
+        };
+        let m = meta(8.0, 1_000);
+        assert!((m.decayed_score(1_000, &cfg) - 8.0).abs() < f32::EPSILON);
+        assert!((m.decayed_score(10_999, &cfg) - 8.0).abs() < f32::EPSILON);
+        assert!((m.decayed_score(11_000, &cfg) - 4.0).abs() < f32::EPSILON);
+        assert!((m.decayed_score(21_000, &cfg) - 2.0).abs() < f32::EPSILON);
+        assert!(m.decayed_score(31_000, &cfg).abs() < f32::EPSILON);
+        // A clock reading before `last_accessed` does not inflate the score.
+        assert!((m.decayed_score(0, &cfg) - 8.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn tournament_picks_lowest_decayed_score() {
+        let entries = [
+            ("a", meta(3.0, 0)),
+            ("b", meta(0.5, 0)),
+            ("c", meta(2.0, 0)),
+        ];
+        let victim = tournament_victim(&entries, 0, &exhaustive(), &mut rng());
+        assert_eq!(victim, Some(1));
+    }
+
+    #[test]
+    fn hot_entry_decayed_to_zero_loses_the_tournament() {
+        // Default config: halve per second, zero after 32 s. 40 s later the hot entry's
+        // stored score of 100 is worth less than a fresh entry's 0.5.
+        let entries = [("hot", meta(100.0, 0)), ("fresh", meta(0.5, 40_000))];
+        let victim = tournament_victim(&entries, 40_000, &exhaustive(), &mut rng());
+        assert_eq!(victim, Some(0));
+    }
+
+    #[test]
+    fn ties_at_zero_evict_the_least_recently_accessed() {
+        let entries = [
+            ("newer", meta(9.0, 20_000)),
+            ("oldest", meta(9.0, 5_000)),
+            ("newest", meta(9.0, 30_000)),
+        ];
+        // At 100 s every score has decayed to exactly 0.
+        let victim = tournament_victim(&entries, 100_000, &exhaustive(), &mut rng());
+        assert_eq!(victim, Some(1));
+    }
+
+    #[test]
+    fn n_samples_controls_how_often_the_minimum_is_found() {
+        let entries: Vec<(usize, Metadata)> = (0..10_u16)
+            .map(|i| (usize::from(i), meta(f32::from(i), 0)))
+            .collect();
+        let one = EngineConfig {
+            n_samples: 1,
+            ..Default::default()
+        };
+        let mut rng = rng();
+        let min_found = |cfg: &EngineConfig, rng: &mut StdRng| {
+            (0..200)
+                .filter(|_| tournament_victim(&entries, 0, cfg, rng) == Some(0))
+                .count()
+        };
+        assert_eq!(min_found(&exhaustive(), &mut rng), 200);
+        // With one sample the minimum is found about 1 time in 10.
+        assert!(min_found(&one, &mut rng) < 60);
+    }
+
+    #[test]
+    fn tournament_on_empty_slice_has_no_victim() {
+        let entries: [(u8, Metadata); 0] = [];
+        assert_eq!(
+            tournament_victim(&entries, 0, &exhaustive(), &mut rng()),
+            None
+        );
+    }
+
+    #[test]
+    fn swap_remove_indexed_repoints_the_moved_entry() {
+        let mut entries = vec![("a", 1), ("b", 2), ("c", 3)];
+        let mut map: HashMap<&str, usize> = HashMap::from([("a", 0), ("b", 1), ("c", 2)]);
+
+        assert_eq!(swap_remove_indexed(&mut map, &mut entries, 0), ("a", 1));
+        assert_eq!(entries, vec![("c", 3), ("b", 2)]);
+        assert_eq!(map, HashMap::from([("c", 0), ("b", 1)]));
+
+        // Removing the last entry moves nothing.
+        assert_eq!(swap_remove_indexed(&mut map, &mut entries, 1), ("b", 2));
+        assert_eq!(map, HashMap::from([("c", 0)]));
+    }
 }
