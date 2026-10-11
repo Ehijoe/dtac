@@ -20,6 +20,16 @@ files must be numbered so the order to apply them is clear:
 - Apply plans in ascending numeric order. Never renumber an existing plan; if a plan is superseded,
   note that at the top of the old file instead of deleting it.
 
+## Commits
+
+Keep commits small and focused so a reviewer can dig into one part of a change on its own:
+
+- Split work into one commit per logical part (e.g. per plan section: a data structure, a
+  heuristic, a config surface, binary wiring, docs) instead of one large commit.
+- Each commit should build and pass `cargo test` on its own.
+- Write a subject line that says what the commit does, plus a short body explaining why when it
+  isn't obvious.
+
 ## Commands
 
 Build/test commands assume a working Rust toolchain (`rustup default stable` if `cargo` reports no
