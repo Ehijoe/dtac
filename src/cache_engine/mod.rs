@@ -7,6 +7,7 @@ pub mod config;
 
 use crate::clock::{Clock, SystemClock};
 use crate::error::Result;
+use crate::sync::lock;
 use config::EngineConfig;
 use rand::Rng;
 use std::collections::HashMap;
@@ -174,6 +175,18 @@ impl<K: Eq + Hash + Clone, P: Clone> CacheShard<K, P> {
         self.ghost_entries.push((key, meta));
     }
 
+    /// The stored metadata of `key` if it is in the main or ghost cache.
+    fn meta_of(&self, key: &K) -> Option<Metadata> {
+        self.main_cache_map.get(key).map_or_else(
+            || {
+                self.ghost_map
+                    .get(key)
+                    .map(|&idx| self.ghost_entries[idx].1)
+            },
+            |&idx| Some(self.entries[idx].1.meta),
+        )
+    }
+
     /// Removes `key` from the ghost cache if present (it may already have been evicted).
     fn remove_ghost(&mut self, key: &K) {
         if let Some(&idx) = self.ghost_map.get(key) {
@@ -191,6 +204,7 @@ impl<K: Eq + Hash + Clone, P: Clone> CacheShard<K, P> {
 }
 
 /// The Dynamic Traffic-Aware Cache (DTAC) Engine.
+///
 /// Implements a Randomized Eviction architecture combined with a resource-specific
 /// Exponentially Weighted Moving Average (EWMA) and a metadata-only Ghost Cache.
 #[derive(Debug)]
@@ -268,22 +282,14 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     /// The number of resources currently in the main cache, across all shards.
     ///
     /// Locks every shard in turn, so it is meant for reporting, not for hot paths.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a shard's mutex is poisoned (i.e. a previous lock holder panicked).
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.lock().unwrap().entries.len())
+            .map(|shard| lock(shard).entries.len())
             .sum()
     }
 
     /// Whether the main cache is empty. See [`len`](Self::len).
-    ///
-    /// # Panics
-    ///
-    /// Panics if a shard's mutex is poisoned (i.e. a previous lock holder panicked).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -292,18 +298,16 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     ///
     /// Reported next to hit rates to show the engine's metadata overhead. Locks every
     /// shard in turn, so it is meant for reporting, not for hot paths.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a shard's mutex is poisoned (i.e. a previous lock holder panicked).
     pub fn ghost_len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.lock().unwrap().ghost_entries.len())
+            .map(|shard| lock(shard).ghost_entries.len())
             .sum()
     }
 
     /// Hashes the requested resource to determine its specific concurrency bucket.
+    // Only the hash's low bits matter for picking one of NUM_SHARDS shards.
+    #[allow(clippy::cast_possible_truncation)]
     fn get_shard_id(resource: &K) -> usize {
         let mut hasher = DefaultHasher::new();
         resource.hash(&mut hasher);
@@ -317,13 +321,9 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     /// numbers are always equal (every `entries` slot is reachable from exactly
     /// one `main_cache_map` entry); a mismatch indicates an orphaned/leaked
     /// capacity slot.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a shard's mutex is poisoned (i.e. a previous lock holder panicked).
     pub fn debug_integrity_counts(&self) -> (usize, usize) {
         self.shards.iter().fold((0, 0), |(e, m), shard| {
-            let shard = shard.lock().unwrap();
+            let shard = lock(shard);
             (e + shard.entries.len(), m + shard.main_cache_map.len())
         })
     }
@@ -332,15 +332,11 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     ///
     /// Intended for tests/diagnostics only. In a consistent cache the two numbers are
     /// equal and at most [`ghost_capacity_per_shard`](Self::ghost_capacity_per_shard).
-    ///
-    /// # Panics
-    ///
-    /// Panics if a shard's mutex is poisoned (i.e. a previous lock holder panicked).
     pub fn debug_ghost_counts(&self) -> Vec<(usize, usize)> {
         self.shards
             .iter()
             .map(|shard| {
-                let shard = shard.lock().unwrap();
+                let shard = lock(shard);
                 (shard.ghost_entries.len(), shard.ghost_map.len())
             })
             .collect()
@@ -349,22 +345,8 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     /// The current decayed score of `resource` if it is in the main or ghost cache.
     ///
     /// Intended for tests/diagnostics only.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the shard's mutex is poisoned (i.e. a previous lock holder panicked).
     pub fn debug_score(&self, resource: &K) -> Option<f32> {
-        let shard = self.shards[Self::get_shard_id(resource)].lock().unwrap();
-        let meta = shard.main_cache_map.get(resource).map_or_else(
-            || {
-                shard
-                    .ghost_map
-                    .get(resource)
-                    .map(|&idx| shard.ghost_entries[idx].1)
-            },
-            |&idx| Some(shard.entries[idx].1.meta),
-        )?;
-        drop(shard);
+        let meta = lock(&self.shards[Self::get_shard_id(resource)]).meta_of(resource)?;
         Some(meta.decayed_score(self.clock.now_millis(), &self.config))
     }
 
@@ -387,8 +369,8 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
         // Phase 1: Concurrency Management (Lock Sharding)
         let shard_id = Self::get_shard_id(&requested_resource);
 
-        let (action, payload) = {
-            let mut shard = self.shards[shard_id].lock().unwrap();
+        let action = {
+            let mut shard = lock(&self.shards[shard_id]);
             let current_time = self.clock.now_millis();
 
             // Phase 2: Cache Hit Evaluation & Score Update
@@ -422,7 +404,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
                 match slot {
                     Slot::Main(idx) => {
                         shard.entries[idx].1.meta = meta;
-                        (Action::Hit, Some(shard.entries[idx].1.payload.clone()))
+                        Action::Hit(shard.entries[idx].1.payload.clone())
                     }
                     Slot::Ghost(idx) => {
                         // Store the updated meta in place; on promotion the ghost entry
@@ -430,9 +412,9 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
                         shard.ghost_entries[idx].1 = meta;
                         // Promotion from Ghost Cache to Main Cache
                         if new_score >= self.config.promotion_threshold {
-                            (Action::Promote(meta), None)
+                            Action::Promote(meta)
                         } else {
-                            (Action::GhostHit, None)
+                            Action::GhostHit
                         }
                     }
                 }
@@ -448,15 +430,15 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
                     current_time,
                     &self.config,
                 );
-                (Action::Miss, None)
+                Action::Miss
             }
         };
 
         match action {
-            Action::Hit => payload.unwrap(),
+            Action::Hit(payload) => payload,
             Action::Promote(meta) => {
                 let payload = fetch_from_origin(&requested_resource).await;
-                let mut shard = self.shards[shard_id].lock().unwrap();
+                let mut shard = lock(&self.shards[shard_id]);
 
                 // Another concurrent task may have already promoted this same key
                 // while our fetch_from_origin above was in flight (the shard lock is
@@ -510,8 +492,8 @@ enum Slot {
     Ghost(usize),
 }
 
-enum Action {
-    Hit,
+enum Action<P> {
+    Hit(P),
     Promote(Metadata),
     GhostHit,
     Miss,
