@@ -66,7 +66,7 @@ impl ManualClock {
         // The closure always returns `Some`, so `fetch_update` cannot fail.
         let _ = self
             .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
                 Some(now.saturating_add(by))
             });
     }
