@@ -5,6 +5,8 @@ mod common;
 use clap::Parser;
 use common::AsnArgs;
 use dtac::cache_engine::NUM_SHARDS;
+use dtac::cache_engine::config::EngineConfig;
+use dtac::clock::ManualClock;
 use dtac::dtac_cache::DtacCache;
 use dtac::heuristic_router::HeuristicRouter;
 use dtac::heuristic_router::config::RouterConfig;
@@ -37,6 +39,17 @@ enum Algorithm {
     Lru,
 }
 
+/// Where the cache engine and router read time from during a replay.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ClockMode {
+    /// Simulated time taken from each record's logged timestamp, so `--speed` only
+    /// changes how long the replay takes, not what it measures.
+    Log,
+    /// The real wall clock: decay and velocity happen on the replay's compressed
+    /// timeline, so results depend on `--speed`. Reproduces pre-plan-002 behaviour.
+    Wall,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -62,11 +75,30 @@ struct Args {
 
     /// Playback speed multiplier relative to the recorded timestamps.
     /// 1.0 = realtime (what the log's timestamps actually encode); higher
-    /// values replay faster. Defaults to a fast constant so existing
-    /// quick-iteration runs stay quick; pass `--speed 1.0` to exercise the
-    /// router's per-IP velocity heuristic against realistic request cadence.
+    /// values replay faster. With `--clock log` (the default) this only
+    /// changes how long the replay takes; with `--clock wall` it also
+    /// compresses the timeline that decay and velocity are measured on.
     #[arg(long, default_value_t = 10_000.0)]
     speed: f64,
+
+    /// Time source for score decay and request velocity.
+    ///
+    /// `log` sets a shared simulated clock to each record's timestamp just
+    /// before its access. Known imprecision: the clock only moves forward, so
+    /// with up to `--concurrency` tasks in flight a request can see a time a
+    /// few milliseconds ahead of its own if a later record's task set the
+    /// clock first. With half-lives of seconds this is negligible.
+    #[arg(long, value_enum, default_value_t = ClockMode::Log)]
+    clock: ClockMode,
+
+    /// JSON file with `EngineConfig` fields; omitted fields keep their defaults.
+    #[arg(long, value_name = "PATH")]
+    engine_config: Option<PathBuf>,
+
+    /// Ghost-cache capacity as a multiple of the main-cache capacity. Overrides
+    /// `ghost_multiplier` from `--engine-config`.
+    #[arg(long, value_name = "N")]
+    ghost_multiplier: Option<usize>,
 
     /// Which caching algorithm to replay the log against. Run the tool
     /// twice, once per value, against the same log file to compare their
@@ -109,6 +141,29 @@ fn build_router(args: &Args) -> Result<HeuristicRouter, Box<dyn std::error::Erro
     println!("Router config:  {}", serde_json::to_string(&config)?);
 
     Ok(HeuristicRouter::with_config(config, asn_db)?)
+}
+
+/// Builds the engine config from `--engine-config` and `--ghost-multiplier`.
+fn build_engine_config(args: &Args) -> Result<EngineConfig, Box<dyn std::error::Error>> {
+    let mut config = match &args.engine_config {
+        Some(path) => serde_json::from_reader(BufReader::new(File::open(path)?))?,
+        None => EngineConfig::default(),
+    };
+    if let Some(multiplier) = args.ghost_multiplier {
+        config.ghost_multiplier = multiplier;
+    }
+    println!("Engine config:  {}", serde_json::to_string(&config)?);
+    Ok(config)
+}
+
+/// Moves the simulated clock to a record's logged `timestamp` (in seconds).
+///
+/// The clock never moves backwards, so after every record has been dispatched it
+/// reads the latest timestamp, regardless of the order the tasks ran in.
+fn set_log_time(clock: &ManualClock, timestamp: f64) {
+    // `as` saturates: negative or NaN timestamps map to 0.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    clock.set_millis((timestamp * 1000.0) as u64);
 }
 
 /// Logs per-request router/cache events to stderr only when `RUST_LOG` is set, since
@@ -252,6 +307,58 @@ enum Engine {
     Lru(Arc<BaselineLruEngine<String, bytes::Bytes>>),
 }
 
+/// Prints the run's parameters: sizes, algorithm, clock mode and playback speed.
+fn print_run_header(args: &Args, records: &[LogRecord]) {
+    println!("Cache Capacity: {}", args.capacity);
+    println!("Worker Concurrency: {}", args.concurrency);
+    println!("Algorithm:              {:?}", args.algorithm);
+    println!(
+        "Clock:          {:?}{}",
+        args.clock,
+        match args.clock {
+            ClockMode::Log => " (simulated from log timestamps; --speed does not affect results)",
+            ClockMode::Wall => " (wall clock; results depend on --speed)",
+        }
+    );
+    let is_realtime = (args.speed - 1.0).abs() < f64::EPSILON;
+    println!(
+        "Playback Speed: {:.2}x{}",
+        args.speed,
+        if is_realtime { " (realtime)" } else { "" }
+    );
+    if let (Some(first), Some(last)) = (records.first(), records.last()) {
+        let logged_span_secs = (last.timestamp - first.timestamp).max(0.0);
+        println!(
+            "Estimated wall time: {:.1}s ({:.1}s of logged traffic at {:.2}x)",
+            logged_span_secs / args.speed,
+            logged_span_secs,
+            args.speed
+        );
+    }
+}
+
+/// Builds the cache selected by `--algorithm`. For DTAC this prints the effective
+/// router and engine configs, and wires in `log_clock` when replaying on log time.
+fn build_engine(
+    args: &Args,
+    log_clock: Option<&Arc<ManualClock>>,
+) -> Result<Engine, Box<dyn std::error::Error>> {
+    Ok(match args.algorithm {
+        Algorithm::Dtac => {
+            let mut builder = DtacCache::<String, bytes::Bytes>::builder(args.capacity)
+                .router(build_router(args)?)
+                .engine_config(build_engine_config(args)?)?;
+            if let Some(clock) = log_clock {
+                builder = builder.clock(clock.clone());
+            }
+            Engine::Dtac(Arc::new(builder.build()))
+        }
+        Algorithm::Lru => Engine::Lru(Arc::new(BaselineLruEngine::<String, bytes::Bytes>::new(
+            args.capacity,
+        ))),
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -288,36 +395,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let total_records = records.len();
     println!("Loaded {total_records} records into memory.");
-    println!("Cache Capacity: {}", args.capacity);
-    println!("Worker Concurrency: {}", args.concurrency);
-    println!("Algorithm:              {:?}", args.algorithm);
-    let is_realtime = (args.speed - 1.0).abs() < f64::EPSILON;
-    println!(
-        "Playback Speed: {:.2}x{}",
-        args.speed,
-        if is_realtime { " (realtime)" } else { "" }
-    );
-    if let (Some(first), Some(last)) = (records.first(), records.last()) {
-        let logged_span_secs = (last.timestamp - first.timestamp).max(0.0);
-        println!(
-            "Estimated wall time: {:.1}s ({:.1}s of logged traffic at {:.2}x)",
-            logged_span_secs / args.speed,
-            logged_span_secs,
-            args.speed
-        );
-    }
+    print_run_header(&args, &records);
 
     // 3. Initialize Cache & Metrics Tracker
-    let engine = match args.algorithm {
-        Algorithm::Dtac => Engine::Dtac(Arc::new(
-            DtacCache::<String, bytes::Bytes>::builder(args.capacity)
-                .router(build_router(&args)?)
-                .build(),
-        )),
-        Algorithm::Lru => Engine::Lru(Arc::new(BaselineLruEngine::<String, bytes::Bytes>::new(
-            args.capacity,
-        ))),
-    };
+    let log_clock = (args.clock == ClockMode::Log).then(|| Arc::new(ManualClock::new(0)));
+    let engine = build_engine(&args, log_clock.as_ref())?;
     let metrics = Arc::new(BenchMetrics::default());
     let default_payload = bytes::Bytes::from(vec![0u8; args.payload_size]);
 
@@ -363,6 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .expect("semaphore closed");
         let engine = engine.clone();
+        let log_clock = log_clock.clone();
         let metrics = metrics.clone();
         let pb = pb.clone();
         let payload = default_payload.clone();
@@ -406,8 +489,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            if let Some(clock) = &log_clock {
+                set_log_time(clock, record.timestamp);
+            }
+
             let req_start = Instant::now();
-            let _ = match engine {
+            let _ = match &engine {
                 Engine::Dtac(cache) => {
                     // RequestData is only built for the Dtac arm -- the Lru
                     // baseline is bot-unaware by definition, so building it
@@ -442,6 +529,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Gather and compute final statistics
     print_results(&metrics, total_wall_time, &registry, args.algorithm);
+    if let Engine::Dtac(cache) = &engine {
+        // Metadata overhead: the ghost cache holds keys and scores but no payloads.
+        println!(
+            "Final cache entries: {} main, {} ghost (bound {} per shard)",
+            cache.engine().len(),
+            cache.engine().ghost_len(),
+            cache.engine().ghost_capacity_per_shard()
+        );
+    }
 
     Ok(())
 }
@@ -592,6 +688,22 @@ mod tests {
         let at_10x = target_instant(start, 10.0, 10.0);
         assert!(at_10x < at_1x);
         assert_eq!(at_10x, start + Duration::from_secs_f64(1.0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn log_clock_reads_last_timestamp_after_dispatch() {
+        let clock = Arc::new(ManualClock::new(0));
+        // Multiples of 1/8 s are exact in binary, so the expected value is exact too.
+        let timestamps: Vec<f64> = (0..1_000).map(|i| f64::from(i) * 0.125).collect();
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for &timestamp in &timestamps {
+            let clock = clock.clone();
+            tasks.spawn(async move { set_log_time(&clock, timestamp) });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(dtac::clock::Clock::now_millis(&*clock), 999 * 125);
     }
 
     #[tokio::test]
