@@ -23,13 +23,14 @@ jobs:
       - run: cargo test --locked
 
   rust-lint:
-    name: Clippy
+    name: Format & Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
       - uses: Swatinem/rust-cache@v2
       # Fails on clippy errors (incl. deny-by-default correctness lints). The
       # pedantic/nursery/cargo groups enabled in Cargo.toml stay warnings for now
