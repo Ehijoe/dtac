@@ -168,9 +168,12 @@ impl HeuristicRouter {
         let mut score = self.l_0;
 
         // Heuristic A: Continuous Graded Velocity Penalty
-        let float_v = new_velocity as f64 / 1024.0;
+        let float_v = f64::from(new_velocity) / 1024.0;
         if float_v > self.config.burst_threshold {
-            score += self.config.alpha * (float_v / self.config.burst_threshold).ln();
+            score = self
+                .config
+                .alpha
+                .mul_add((float_v / self.config.burst_threshold).ln(), score);
         }
 
         // Heuristic B: Infrastructure Origin (Datacenter ASN)

@@ -77,7 +77,6 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
     ///
     /// It first evaluates the request using the heuristic router to get a bot score,
     /// then calls the cache engine's `access` method.
-
     pub async fn access<F, Fut>(
         &self,
         requested_resource: K,
@@ -92,11 +91,14 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
 
         debug!("Processing request for resource");
 
-        // Calculate the score proxying for AI-Score
-        let request_bot_prob = match self.router.evaluate_request(&request_data).await {
-            Ok(score) => score.value() as f32,
-            Err(_) => 0.5, // fallback if evaluation fails
-        };
+        // Calculate the score proxying for AI-Score; 0.5 is the fallback if evaluation fails.
+        // A probability in [0, 1] loses nothing that matters when narrowed to f32.
+        #[allow(clippy::cast_possible_truncation)]
+        let request_bot_prob = self
+            .router
+            .evaluate_request(&request_data)
+            .await
+            .map_or(0.5, |score| score.value() as f32);
 
         // Track whether it was a hit or miss
         let mut was_hit = true;

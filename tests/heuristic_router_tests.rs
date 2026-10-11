@@ -8,7 +8,7 @@ use std::net::IpAddr;
 #[tokio::test]
 async fn test_heuristic_router_new() {
     let router = HeuristicRouter::new();
-    assert!(format!("{:?}", router).contains("HeuristicRouter"));
+    assert!(format!("{router:?}").contains("HeuristicRouter"));
 }
 
 #[tokio::test]
