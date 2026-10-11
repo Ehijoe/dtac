@@ -91,7 +91,12 @@ impl SpaceSaver {
             return;
         }
 
-        let threshold = now.saturating_sub(half_life_seconds);
+        // Nothing can be a full half-life old yet. Without this guard a saturated
+        // threshold of 0 would "decay" entries seen at time 0 by a factor of 1 and
+        // reinsert them at time 0, forever.
+        let Some(threshold) = now.checked_sub(half_life_seconds) else {
+            return;
+        };
 
         // Repeatedly check the oldest item
         while let Some(&(oldest_time, oldest_ip)) = state.times.first() {
@@ -371,6 +376,27 @@ mod tests {
         let ip2_state = state.lookup.get(&ip2).unwrap();
         assert_eq!(ip2_state.count, 3);
         assert_eq!(ip2_state.last_seen, 1000);
+    }
+
+    #[test]
+    fn decay_and_prune_before_first_half_life_terminates() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut state = State {
+            lookup: HashMap::from([(
+                ip,
+                IpState {
+                    count: 3,
+                    last_seen: 0,
+                    ..Default::default()
+                },
+            )]),
+            counts: BTreeSet::from([(3, ip)]),
+            times: BTreeSet::from([(0, ip)]),
+        };
+
+        // `now` is less than one half-life after the epoch: nothing may decay.
+        SpaceSaver::decay_and_prune(&mut state, 200, 100);
+        assert_eq!(state.lookup[&ip].count, 3);
     }
 
     #[tokio::test]
