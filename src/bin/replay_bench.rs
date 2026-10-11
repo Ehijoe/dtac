@@ -22,9 +22,9 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant as TokioInstant, sleep_until};
@@ -258,19 +258,27 @@ struct BaselineLruEngine<K, P> {
 
 impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
     fn new(total_capacity: usize) -> Self {
-        let capacity_per_shard = (total_capacity / NUM_SHARDS).max(1);
-        let cap = NonZeroUsize::new(capacity_per_shard)
-            .expect("capacity_per_shard is .max(1)'d above, never zero");
+        let cap = NonZeroUsize::new(total_capacity / NUM_SHARDS).unwrap_or(NonZeroUsize::MIN);
         let shards = (0..NUM_SHARDS)
             .map(|_| Mutex::new(LruCache::new(cap)))
             .collect();
         Self { shards }
     }
 
+    // Only the hash's low bits matter for picking one of NUM_SHARDS shards.
+    #[allow(clippy::cast_possible_truncation)]
     fn get_shard_id(key: &K) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         (hasher.finish() as usize) % NUM_SHARDS
+    }
+
+    /// Locks one shard, recovering the guard if a previous holder panicked, the same
+    /// way `DtacCacheEngine` does.
+    fn shard(&self, shard_id: usize) -> MutexGuard<'_, LruCache<K, P>> {
+        self.shards[shard_id]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     async fn access<F, Fut>(&self, key: K, fetch_from_origin: F) -> P
@@ -280,12 +288,8 @@ impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
     {
         let shard_id = Self::get_shard_id(&key);
 
-        let hit = {
-            let mut shard = self.shards[shard_id]
-                .lock()
-                .expect("baseline LRU shard mutex poisoned");
-            shard.get(&key).cloned() // lru's get() already promotes to MRU
-        };
+        // lru's get() already promotes to MRU
+        let hit = self.shard(shard_id).get(&key).cloned();
         if let Some(payload) = hit {
             return payload;
         }
@@ -293,10 +297,8 @@ impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
         // Release the lock before awaiting, matching DtacCacheEngine's
         // convention of never holding a shard lock across an await point.
         let payload = fetch_from_origin(&key).await;
-        let mut shard = self.shards[shard_id]
-            .lock()
-            .expect("baseline LRU shard mutex poisoned");
-        shard.put(key, payload.clone()); // idempotent per key: no orphan-entry risk
+        // idempotent per key: no orphan-entry risk
+        self.shard(shard_id).put(key, payload.clone());
         payload
     }
 }
@@ -305,6 +307,34 @@ impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
 enum Engine {
     Dtac(Arc<DtacCache<String, bytes::Bytes>>),
     Lru(Arc<BaselineLruEngine<String, bytes::Bytes>>),
+}
+
+/// Routes the library's OpenTelemetry metrics into a fresh Prometheus registry.
+fn init_metrics() -> Result<prometheus::Registry, Box<dyn std::error::Error>> {
+    let registry = prometheus::Registry::new();
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .build()?;
+    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_reader(exporter)
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider);
+    Ok(registry)
+}
+
+/// Reads every non-blank line of the NDJSON log at `path` into memory.
+fn load_records(path: &Path) -> Result<Vec<LogRecord>, Box<dyn std::error::Error>> {
+    println!("Loading log entries into memory from {}...", path.display());
+    let reader = BufReader::with_capacity(32 * 1024 * 1024, File::open(path)?);
+
+    let mut records: Vec<LogRecord> = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if !line.trim().is_empty() {
+            records.push(serde_json::from_str(&line)?);
+        }
+    }
+    Ok(records)
 }
 
 /// Prints the run's parameters: sizes, algorithm, clock mode and playback speed.
@@ -359,6 +389,80 @@ fn build_engine(
     })
 }
 
+/// Replays one log record through `engine` and records its outcome in `metrics`.
+async fn replay_record(
+    record: LogRecord,
+    engine: &Engine,
+    log_clock: Option<&ManualClock>,
+    metrics: &Arc<BenchMetrics>,
+    payload: bytes::Bytes,
+) {
+    let is_bot = record.traffic_type == "bot";
+    let is_measurement = record.phase == Phase::Measurement;
+
+    // Track total counts per category -- warm-up records still run
+    // through the real cache below, but never touch BenchMetrics.
+    if is_measurement {
+        metrics.total_requests.fetch_add(1, Ordering::Relaxed);
+        if is_bot {
+            metrics.bot_requests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            metrics.human_requests.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let path = record.path.clone();
+    let metrics_fetch = metrics.clone();
+
+    // Closure triggered ONLY on a cache miss
+    let fetch_from_origin = |_key: &String| {
+        let metrics_fetch = metrics_fetch.clone();
+        let payload = payload.clone();
+        async move {
+            if is_measurement {
+                metrics_fetch
+                    .cache_miss_fetches
+                    .fetch_add(1, Ordering::Relaxed);
+                if is_bot {
+                    metrics_fetch.bot_misses.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    metrics_fetch.human_misses.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            payload
+        }
+    };
+
+    if let Some(clock) = log_clock {
+        set_log_time(clock, record.timestamp);
+    }
+
+    let req_start = Instant::now();
+    let _ = match engine {
+        Engine::Dtac(cache) => {
+            // RequestData is only built for the Dtac arm -- the Lru
+            // baseline is bot-unaware by definition, so building it
+            // there would be pure overhead skewing the two
+            // algorithms' measured per-request latency against
+            // each other without affecting hit-rate correctness.
+            let req_data = RequestData {
+                ip_address: resolve_ip(&record.ip),
+                path: record.path,
+                method: record.method,
+                headers: record.headers,
+            };
+            cache.access(path, req_data, fetch_from_origin).await
+        }
+        Engine::Lru(baseline) => baseline.access(path, fetch_from_origin).await,
+    };
+    if is_measurement {
+        metrics.total_duration_us.fetch_add(
+            u64::try_from(req_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -369,30 +473,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing_if_requested();
 
     // 1. Initialize Prometheus & OpenTelemetry Registry
-    let registry = prometheus::Registry::new();
-    let exporter = opentelemetry_prometheus::exporter()
-        .with_registry(registry.clone())
-        .build()
-        .expect("Failed to build prometheus exporter");
-    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-        .with_reader(exporter)
-        .build();
-    opentelemetry::global::set_meter_provider(meter_provider);
+    let registry = init_metrics()?;
 
     // 2. Load NDJSON records into memory
-    println!("Loading log entries into memory from {:?}...", args.file);
-    let file = File::open(&args.file)?;
-    let reader = BufReader::with_capacity(32 * 1024 * 1024, file);
-
-    let mut records: Vec<LogRecord> = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if !line.trim().is_empty() {
-            let record: LogRecord = serde_json::from_str(&line)?;
-            records.push(record);
-        }
-    }
-
+    let records = load_records(&args.file)?;
     let total_records = records.len();
     println!("Loaded {total_records} records into memory.");
     print_run_header(&args, &records);
@@ -439,11 +523,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // If --speed is set too low for the given --concurrency, this is
         // where the dispatch loop will stall waiting for a free slot --
         // intentional backpressure, not a bug.
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore closed");
+        let permit = semaphore.clone().acquire_owned().await?;
         let engine = engine.clone();
         let log_clock = log_clock.clone();
         let metrics = metrics.clone();
@@ -453,69 +533,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         join_set.spawn(async move {
             let _permit = permit; // held for the duration of this task, released on completion
 
-            let is_bot = record.traffic_type == "bot";
-            let is_measurement = record.phase == Phase::Measurement;
-
-            // Track total counts per category -- warm-up records still run
-            // through the real cache below, but never touch BenchMetrics.
-            if is_measurement {
-                metrics.total_requests.fetch_add(1, Ordering::Relaxed);
-                if is_bot {
-                    metrics.bot_requests.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    metrics.human_requests.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-
-            let path = record.path.clone();
-            let metrics_fetch = metrics.clone();
-
-            // Closure triggered ONLY on a cache miss
-            let fetch_from_origin = |_key: &String| {
-                let metrics_fetch = metrics_fetch.clone();
-                let payload = payload.clone();
-                async move {
-                    if is_measurement {
-                        metrics_fetch
-                            .cache_miss_fetches
-                            .fetch_add(1, Ordering::Relaxed);
-                        if is_bot {
-                            metrics_fetch.bot_misses.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            metrics_fetch.human_misses.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    payload
-                }
-            };
-
-            if let Some(clock) = &log_clock {
-                set_log_time(clock, record.timestamp);
-            }
-
-            let req_start = Instant::now();
-            let _ = match &engine {
-                Engine::Dtac(cache) => {
-                    // RequestData is only built for the Dtac arm -- the Lru
-                    // baseline is bot-unaware by definition, so building it
-                    // there would be pure overhead skewing the two
-                    // algorithms' measured per-request latency against
-                    // each other without affecting hit-rate correctness.
-                    let req_data = RequestData {
-                        ip_address: resolve_ip(&record.ip),
-                        path: record.path,
-                        method: record.method,
-                        headers: record.headers,
-                    };
-                    cache.access(path, req_data, fetch_from_origin).await
-                }
-                Engine::Lru(baseline) => baseline.access(path, fetch_from_origin).await,
-            };
-            if is_measurement {
-                metrics
-                    .total_duration_us
-                    .fetch_add(req_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
+            replay_record(record, &engine, log_clock.as_deref(), &metrics, payload).await;
 
             pb.inc(1);
         });
@@ -542,6 +560,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Request counts and microsecond totals are far below 2^52, so f64 is exact here.
+#[allow(clippy::cast_precision_loss)]
 fn print_results(
     m: &BenchMetrics,
     total_time: Duration,
@@ -592,23 +612,19 @@ fn print_results(
     println!("          {report_label} DIRECT BENCHMARK REPORT          ");
     println!("          (post-warm-up, steady-state measurement)        ");
     println!("========================================================");
-    println!("Elapsed Time:           {:.3?}", total_time);
-    println!("Throughput:             {:.2} ops/sec", rps);
-    println!("Average Access Time:    {:.3} µs", avg_latency_us);
+    println!("Elapsed Time:           {total_time:.3?}");
+    println!("Throughput:             {rps:.2} ops/sec");
+    println!("Average Access Time:    {avg_latency_us:.3} µs");
     println!("--------------------------------------------------------");
     println!("PRIMARY METRIC");
-    println!("Human Requests:         {}", human_reqs);
+    println!("Human Requests:         {human_reqs}");
     println!(
-        "Human Cache Hit Rate:   {:.2}% ({} hits / {} misses)",
-        human_hit_rate, human_hits, human_misses
+        "Human Cache Hit Rate:   {human_hit_rate:.2}% ({human_hits} hits / {human_misses} misses)"
     );
     println!("--------------------------------------------------------");
     println!("SECONDARY METRIC");
-    println!("Total Requests:         {}", total_reqs);
-    println!(
-        "Overall Cache Hit Rate: {} ({:.2}%)",
-        total_hits, overall_hit_rate
-    );
+    println!("Total Requests:         {total_reqs}");
+    println!("Overall Cache Hit Rate: {total_hits} ({overall_hit_rate:.2}%)");
     println!(
         "Total Cache Misses:     {} ({:.2}%)",
         total_misses,
@@ -616,11 +632,8 @@ fn print_results(
     );
     println!("--------------------------------------------------------");
     println!("FOR REFERENCE ONLY -- not an optimization target");
-    println!("Bot Requests:           {}", bot_reqs);
-    println!(
-        "Bot Cache Hit Rate:     {:.2}% ({} hits / {} misses)",
-        bot_hit_rate, bot_hits, bot_misses
-    );
+    println!("Bot Requests:           {bot_reqs}");
+    println!("Bot Cache Hit Rate:     {bot_hit_rate:.2}% ({bot_hits} hits / {bot_misses} misses)");
     println!("========================================================");
 
     // Print internal Prometheus metrics gathered by DTAC / OpenTelemetry
@@ -628,10 +641,10 @@ fn print_results(
     let encoder = TextEncoder::new();
     let mut buffer = vec![];
     let metric_families = registry.gather();
-    if let Ok(_) = encoder.encode(&metric_families, &mut buffer) {
-        if let Ok(text) = String::from_utf8(buffer) {
-            println!("{}", text);
-        }
+    if encoder.encode(&metric_families, &mut buffer).is_ok()
+        && let Ok(text) = String::from_utf8(buffer)
+    {
+        println!("{text}");
     }
 }
 
@@ -684,10 +697,10 @@ mod tests {
     #[tokio::test]
     async fn target_instant_scales_with_speed() {
         let start = TokioInstant::now();
-        let at_1x = target_instant(start, 10.0, 1.0);
-        let at_10x = target_instant(start, 10.0, 10.0);
-        assert!(at_10x < at_1x);
-        assert_eq!(at_10x, start + Duration::from_secs_f64(1.0));
+        let realtime = target_instant(start, 10.0, 1.0);
+        let ten_times = target_instant(start, 10.0, 10.0);
+        assert!(ten_times < realtime);
+        assert_eq!(ten_times, start + Duration::from_secs_f64(1.0));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

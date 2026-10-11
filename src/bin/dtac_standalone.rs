@@ -5,6 +5,7 @@ mod common;
 use axum::{
     Router,
     extract::{ConnectInfo, Request, State},
+    http::StatusCode,
     response::IntoResponse,
     routing::{any, get},
 };
@@ -26,7 +27,7 @@ struct Args {
     #[arg(short = 'c', long, default_value_t = 1024)]
     capacity: usize,
 
-    /// The 'k' value for SpaceSaver sketch.
+    /// The 'k' value for `SpaceSaver` sketch.
     #[arg(short = 'k', long, default_value_t = 100)]
     sketch_k: usize,
 
@@ -85,7 +86,7 @@ async fn proxy_handler(
     let target = state.target.clone();
 
     let fetch_from_origin = |key: &String| {
-        let url = format!("{}{}", target, key);
+        let url = format!("{target}{key}");
         async move {
             let client = reqwest::Client::new();
             match client.get(&url).send().await {
@@ -95,12 +96,10 @@ async fn proxy_handler(
         }
     };
 
-    let payload = state
+    state
         .cache
         .access(path, request_data, fetch_from_origin)
-        .await;
-
-    payload
+        .await
 }
 
 #[derive(Clone)]
@@ -110,16 +109,21 @@ struct AppState {
     registry: prometheus::Registry,
 }
 
-async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let encoder = TextEncoder::new();
+async fn metrics_handler(State(state): State<AppState>) -> Result<String, (StatusCode, String)> {
     let mut buffer = vec![];
-    let metric_families = state.registry.gather();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    String::from_utf8(buffer).unwrap()
+    TextEncoder::new()
+        .encode(&state.registry.gather(), &mut buffer)
+        .map_err(internal_error)?;
+    String::from_utf8(buffer).map_err(internal_error)
+}
+
+/// Reports `err` to the client as a 500 response.
+fn internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
@@ -132,8 +136,7 @@ async fn main() {
     let registry = prometheus::Registry::new();
     let exporter = opentelemetry_prometheus::exporter()
         .with_registry(registry.clone())
-        .build()
-        .expect("Failed to build prometheus exporter");
+        .build()?;
 
     let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
         .with_reader(exporter)
@@ -173,11 +176,11 @@ async fn main() {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
