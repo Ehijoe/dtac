@@ -228,7 +228,11 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     }
 
     /// Shared constructor; `config` must already be valid.
-    fn build(total_capacity: usize, config: EngineConfig, clock: Arc<dyn Clock>) -> Self {
+    pub(crate) fn build(
+        total_capacity: usize,
+        config: EngineConfig,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let capacity_per_shard = (total_capacity / NUM_SHARDS).max(1);
         let ghost_capacity_per_shard = capacity_per_shard * config.ghost_multiplier;
         let mut shards = Vec::with_capacity(NUM_SHARDS);
