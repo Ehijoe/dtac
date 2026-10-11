@@ -1,15 +1,20 @@
 //! Bounded-memory tracker for IP states.
 
+use crate::clock::{Clock, SystemClock};
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
 
 /// State for a single IP address.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IpState {
     /// Timestamp (in seconds) when this IP was last seen.
     pub last_seen: u64,
+    /// Timestamp (in milliseconds) of this IP's last request, used for the velocity EWMA.
+    ///
+    /// Kept separately from `last_seen` because velocity ticks can be shorter than a
+    /// second, while the `SpaceSaver` count decay works in whole seconds.
+    pub last_seen_ms: u64,
     /// EWMA Velocity, stored with 10 fractional bits (i.e. * 1024).
     pub velocity: u32,
     /// Flag indicating whether this IP is suspected of missing auxiliary assets.
@@ -60,15 +65,23 @@ struct State {
 pub struct SpaceSaver {
     capacity: usize,
     half_life_seconds: u64, // How long it takes for an IP's count to halve
+    clock: Arc<dyn Clock>,
     state: Mutex<State>,
 }
 
 impl SpaceSaver {
-    /// Initializes a new SpaceSaver with a strict maximum memory capacity.
+    /// Initializes a new SpaceSaver with a strict maximum memory capacity, reading time
+    /// from the system clock.
     pub fn new(capacity: usize, half_life_seconds: u64) -> Self {
+        Self::with_clock(capacity, half_life_seconds, SystemClock::shared())
+    }
+
+    /// Like [`new`](Self::new), but reads time from `clock`.
+    pub fn with_clock(capacity: usize, half_life_seconds: u64, clock: Arc<dyn Clock>) -> Self {
         Self {
             capacity,
             half_life_seconds,
+            clock,
             state: Mutex::new(State {
                 lookup: HashMap::with_capacity(capacity),
                 counts: BTreeSet::new(),
@@ -77,12 +90,14 @@ impl SpaceSaver {
         }
     }
 
+    /// Replaces the clock this tracker reads time from.
+    pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
+    }
+
     /// Helper to get the current time in seconds
-    fn now() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
+    fn now(&self) -> u64 {
+        self.clock.now_millis() / 1000
     }
 
     /// Decays the counts of old IPs and removes those that drop to 0.
@@ -136,7 +151,7 @@ impl SpaceSaver {
     pub async fn get_or_add_and_evict(&self, client_ip: IpAddr) -> IpState {
         // Note: Made `state` mutable so we can prune it
         let mut state = self.state.lock().unwrap();
-        let now = Self::now();
+        let now = self.now();
 
         // 1. Clean up entries by decaying counts and removing zeros
         Self::decay_and_prune(&mut state, self.half_life_seconds, now);
@@ -205,7 +220,7 @@ impl SpaceSaver {
         let mut state = self.state.lock().unwrap();
 
         // Ensure the last_seen time is updated
-        new_ip_state.last_seen = Self::now();
+        new_ip_state.last_seen = self.now();
 
         let old_state_opt = state.lookup.get(&client_ip).cloned();
 
@@ -247,6 +262,19 @@ impl SpaceSaver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::ManualClock;
+    use std::time::Duration;
+
+    /// A saver on a manual clock that starts at `start_secs`.
+    fn saver_on_manual_clock(
+        capacity: usize,
+        half_life_seconds: u64,
+        start_secs: u64,
+    ) -> (SpaceSaver, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new(start_secs * 1000));
+        let saver = SpaceSaver::with_clock(capacity, half_life_seconds, clock.clone());
+        (saver, clock)
+    }
 
     #[test]
     fn record_request_flags_only_after_threshold_pages_without_assets() {
@@ -489,21 +517,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_add_and_evict_with_decay() {
-        let saver = SpaceSaver::new(2, 3600);
+        let (saver, clock) = saver_on_manual_clock(2, 3600, 100_000);
 
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
         let ip3: IpAddr = "10.0.0.3".parse().unwrap();
 
-        saver
-            .update(
-                ip1,
-                IpState {
-                    count: 10,
-                    ..Default::default()
-                },
-            )
-            .await;
         saver
             .update(
                 ip2,
@@ -514,15 +533,17 @@ mod tests {
             )
             .await;
 
-        // Manually make ip2 very old so it decays to 0
-        {
-            let mut state = saver.state.lock().unwrap();
-            let mut ip2_state = state.lookup.get(&ip2).unwrap().clone();
-            state.times.remove(&(ip2_state.last_seen, ip2));
-            ip2_state.last_seen = SpaceSaver::now() - 36000; // 10 half-lives
-            state.times.insert((ip2_state.last_seen, ip2));
-            state.lookup.insert(ip2, ip2_state);
-        }
+        // 10 half-lives later ip2 has decayed to 0, while ip1 is fresh.
+        clock.advance(Duration::from_hours(10));
+        saver
+            .update(
+                ip1,
+                IpState {
+                    count: 10,
+                    ..Default::default()
+                },
+            )
+            .await;
 
         // Now getting ip3 should trigger decay of ip2 to 0 (so it gets pruned)
         let state3 = saver.get_or_add_and_evict(ip3).await;
@@ -533,5 +554,52 @@ mod tests {
         assert!(!state.lookup.contains_key(&ip2));
         assert!(state.lookup.contains_key(&ip1));
         assert!(state.lookup.contains_key(&ip3));
+    }
+
+    #[tokio::test]
+    async fn count_halves_per_half_life_on_the_injected_clock() {
+        let (saver, clock) = saver_on_manual_clock(10, 200, 1_000);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        saver
+            .update(
+                ip,
+                IpState {
+                    count: 8,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(saver.get_or_add_and_evict(ip).await.count, 8);
+
+        // 8 * 2^-2 = 2 after two half-lives.
+        clock.advance(Duration::from_secs(400));
+        assert_eq!(saver.get_or_add_and_evict(ip).await.count, 2);
+    }
+
+    #[tokio::test]
+    async fn count_decayed_to_zero_is_pruned() {
+        let (saver, clock) = saver_on_manual_clock(10, 200, 1_000);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let other: IpAddr = "10.0.0.2".parse().unwrap();
+
+        saver
+            .update(
+                ip,
+                IpState {
+                    count: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        // After one half-life a count of 1 must strictly decrease, to 0.
+        clock.advance(Duration::from_secs(200));
+        let _ = saver.get_or_add_and_evict(other).await;
+
+        let state = saver.state.lock().unwrap();
+        assert!(!state.lookup.contains_key(&ip));
+        assert!(state.counts.is_empty());
+        assert!(state.times.is_empty());
     }
 }

@@ -213,3 +213,97 @@ mod asn_and_shy_guys {
         assert!(HeuristicRouter::with_config(config, AsnDatabase::empty()).is_err());
     }
 }
+
+/// Velocity heuristic driven by an injected [`ManualClock`] instead of wall-clock time.
+mod simulated_clock {
+    #![allow(clippy::unwrap_used)]
+
+    use dtac::clock::ManualClock;
+    use dtac::heuristic_router::HeuristicRouter;
+    use dtac::heuristic_router::asn_db::AsnDatabase;
+    use dtac::heuristic_router::config::RouterConfig;
+    use dtac::types::RequestData;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const PRIOR: f64 = 0.1;
+
+    fn router(config: RouterConfig) -> (HeuristicRouter, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new(0));
+        let router = HeuristicRouter::with_config(config, AsnDatabase::empty())
+            .unwrap()
+            .with_clock(clock.clone());
+        (router, clock)
+    }
+
+    /// Sends one request per timestamp (in milliseconds) from a single IP and returns the
+    /// highest score seen.
+    ///
+    /// Requests fetch a stylesheet and carry `Accept-Language`, so velocity is the only
+    /// heuristic that can move the score off the prior.
+    async fn max_score(router: &HeuristicRouter, clock: &ManualClock, times_ms: &[u64]) -> f64 {
+        let req = RequestData {
+            ip_address: "24.1.2.3".parse().unwrap(),
+            path: "/static/site.css".to_string(),
+            method: "GET".to_string(),
+            headers: HashMap::from([("accept-language".to_string(), "en-US".to_string())]),
+        };
+        let mut max = f64::MIN;
+        for &t in times_ms {
+            clock.set_millis(t);
+            max = max.max(router.evaluate_request(&req).await.unwrap().value());
+        }
+        max
+    }
+
+    /// The benchmark's naive bot stream: one IP at about 3.6 req/s for 60 seconds.
+    fn benchmark_bot_rate_times() -> Vec<u64> {
+        (0..216).map(|i| i * 1000 * 10 / 36).collect()
+    }
+
+    #[tokio::test]
+    async fn burst_within_one_second_trips_velocity() {
+        let (router, clock) = router(RouterConfig::default());
+        let times: Vec<u64> = (0..20).map(|i| i * 50).collect();
+        let max = max_score(&router, &clock, &times).await;
+        assert!(
+            max > PRIOR + 1e-6,
+            "20 req in 1 s should exceed the prior, got {max}"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_requests_spread_over_twenty_seconds_do_not() {
+        let (router, clock) = router(RouterConfig::default());
+        let times: Vec<u64> = (0..20).map(|i| i * 1000).collect();
+        let max = max_score(&router, &clock, &times).await;
+        assert!(
+            (max - PRIOR).abs() < 1e-6,
+            "1 req/s should stay at the prior, got {max}"
+        );
+    }
+
+    /// Documents a known gap rather than desired behaviour: on log time, the default
+    /// velocity constants never flag the benchmark's per-IP bot rate (its EWMA settles
+    /// around 7, below `burst_threshold = 10`). Expected to change when plan 004 picks
+    /// calibrated defaults.
+    #[tokio::test]
+    async fn default_config_misses_benchmark_bot_rate() {
+        let (router, clock) = router(RouterConfig::default());
+        let max = max_score(&router, &clock, &benchmark_bot_rate_times()).await;
+        assert!((max - PRIOR).abs() < 1e-6, "expected no penalty, got {max}");
+    }
+
+    #[tokio::test]
+    async fn longer_velocity_tick_flags_benchmark_bot_rate() {
+        let (router, clock) = router(RouterConfig {
+            velocity_tick_ms: 5000,
+            ..Default::default()
+        });
+        let max = max_score(&router, &clock, &benchmark_bot_rate_times()).await;
+        assert!(
+            max > PRIOR + 1e-6,
+            "5 s ticks should flag 3.6 req/s, got {max}"
+        );
+    }
+}

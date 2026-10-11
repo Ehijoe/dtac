@@ -36,6 +36,18 @@ pub struct RouterConfig {
     /// This is a grace period: a short human visit that never pulls the favicon (for
     /// example because the browser already cached it) must not be penalized.
     pub shy_page_threshold: u16,
+    /// Length of one velocity tick, in milliseconds.
+    ///
+    /// The per-IP velocity EWMA is halved (right-shifted) once per tick boundary
+    /// crossed since the IP's previous request. Ticks are aligned to the clock's epoch,
+    /// so with the default of 1000 a request at 0.9 s and one at 1.1 s are one tick apart.
+    pub velocity_tick_ms: u64,
+    /// Number of elapsed ticks after which the velocity resets to a single request
+    /// instead of being decayed.
+    pub velocity_reset_ticks: u64,
+    /// Half-life, in seconds, of the per-IP request counts kept by the bounded IP
+    /// tracker (`SpaceSaver`). `0` disables decay.
+    pub space_saver_half_life_s: u64,
 }
 
 impl Default for RouterConfig {
@@ -48,6 +60,9 @@ impl Default for RouterConfig {
             burst_threshold: 10.0,
             alpha: 2.0,
             shy_page_threshold: 5,
+            velocity_tick_ms: 1000,
+            velocity_reset_ticks: 10,
+            space_saver_half_life_s: 3600,
         }
     }
 }
@@ -87,6 +102,9 @@ impl RouterConfig {
         }
         if self.shy_page_threshold == 0 {
             return invalid("shy_page_threshold must be at least 1".to_string());
+        }
+        if self.velocity_tick_ms == 0 {
+            return invalid("velocity_tick_ms must be at least 1".to_string());
         }
         Ok(())
     }
@@ -139,6 +157,10 @@ mod tests {
             },
             RouterConfig {
                 shy_page_threshold: 0,
+                ..Default::default()
+            },
+            RouterConfig {
+                velocity_tick_ms: 0,
                 ..Default::default()
             },
         ] {
