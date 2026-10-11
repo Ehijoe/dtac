@@ -354,7 +354,10 @@ not-an-ip\t1.2.3.4\t100\tUS\tBAD
     #[test]
     fn asn_list_accepts_prefixes_and_comments() {
         let text = "# hosting\n16509\nAS14061  # DigitalOcean\n\nas24940\n";
-        assert_eq!(read_asn_list(text.as_bytes()).unwrap(), vec![16509, 14061, 24940]);
+        assert_eq!(
+            read_asn_list(text.as_bytes()).unwrap(),
+            vec![16509, 14061, 24940]
+        );
     }
 
     #[test]

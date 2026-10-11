@@ -3,19 +3,19 @@
 mod common;
 
 use axum::{
-    extract::{ConnectInfo, Request, State},
-    routing::{any, get},
     Router,
+    extract::{ConnectInfo, Request, State},
     response::IntoResponse,
+    routing::{any, get},
 };
 use clap::Parser;
 use common::AsnArgs;
 use dtac::dtac_cache::DtacCache;
 use dtac::heuristic_router::HeuristicRouter;
 use dtac::types::RequestData;
-use std::sync::Arc;
-use std::net::SocketAddr;
 use prometheus::{Encoder, TextEncoder};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Simple standalone binary running the DTAC cache engine as a proxy.
@@ -95,7 +95,10 @@ async fn proxy_handler(
         }
     };
 
-    let payload = state.cache.access(path, request_data, fetch_from_origin).await;
+    let payload = state
+        .cache
+        .access(path, request_data, fetch_from_origin)
+        .await;
 
     payload
 }
@@ -131,7 +134,7 @@ async fn main() {
         .with_registry(registry.clone())
         .build()
         .expect("Failed to build prometheus exporter");
-    
+
     let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
         .with_reader(exporter)
         .build();

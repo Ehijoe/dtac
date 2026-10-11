@@ -64,15 +64,26 @@ impl RouterConfig {
         let invalid = |msg: String| Err(DTACError::ConfigError(msg));
 
         if !(self.prior_bot_rate > 0.0 && self.prior_bot_rate < 1.0) {
-            return invalid(format!("prior_bot_rate must be in (0, 1), got {}", self.prior_bot_rate));
+            return invalid(format!(
+                "prior_bot_rate must be in (0, 1), got {}",
+                self.prior_bot_rate
+            ));
         }
-        for (name, weight) in [("w_asn", self.w_asn), ("w_fav", self.w_fav), ("w_hdr", self.w_hdr), ("alpha", self.alpha)] {
+        for (name, weight) in [
+            ("w_asn", self.w_asn),
+            ("w_fav", self.w_fav),
+            ("w_hdr", self.w_hdr),
+            ("alpha", self.alpha),
+        ] {
             if !weight.is_finite() {
                 return invalid(format!("{name} must be finite, got {weight}"));
             }
         }
         if !(self.burst_threshold.is_finite() && self.burst_threshold > 0.0) {
-            return invalid(format!("burst_threshold must be positive, got {}", self.burst_threshold));
+            return invalid(format!(
+                "burst_threshold must be positive, got {}",
+                self.burst_threshold
+            ));
         }
         if self.shy_page_threshold == 0 {
             return invalid("shy_page_threshold must be at least 1".to_string());
@@ -94,7 +105,10 @@ mod tests {
 
     #[test]
     fn prior_log_odds_matches_rate() {
-        let even = RouterConfig { prior_bot_rate: 0.5, ..Default::default() };
+        let even = RouterConfig {
+            prior_bot_rate: 0.5,
+            ..Default::default()
+        };
         assert!(even.prior_log_odds().abs() < 1e-12);
         let low = RouterConfig::default();
         assert!((low.prior_log_odds() - (1.0_f64 / 9.0).ln()).abs() < 1e-12);
@@ -103,12 +117,30 @@ mod tests {
     #[test]
     fn rejects_out_of_range_values() {
         for bad in [
-            RouterConfig { prior_bot_rate: 0.0, ..Default::default() },
-            RouterConfig { prior_bot_rate: 1.0, ..Default::default() },
-            RouterConfig { prior_bot_rate: f64::NAN, ..Default::default() },
-            RouterConfig { w_asn: f64::INFINITY, ..Default::default() },
-            RouterConfig { burst_threshold: 0.0, ..Default::default() },
-            RouterConfig { shy_page_threshold: 0, ..Default::default() },
+            RouterConfig {
+                prior_bot_rate: 0.0,
+                ..Default::default()
+            },
+            RouterConfig {
+                prior_bot_rate: 1.0,
+                ..Default::default()
+            },
+            RouterConfig {
+                prior_bot_rate: f64::NAN,
+                ..Default::default()
+            },
+            RouterConfig {
+                w_asn: f64::INFINITY,
+                ..Default::default()
+            },
+            RouterConfig {
+                burst_threshold: 0.0,
+                ..Default::default()
+            },
+            RouterConfig {
+                shy_page_threshold: 0,
+                ..Default::default()
+            },
         ] {
             assert!(bad.validate().is_err(), "{bad:?} should be rejected");
         }
@@ -116,8 +148,16 @@ mod tests {
 
     #[test]
     fn partial_json_fills_in_defaults() {
-        let cfg: RouterConfig = serde_json::from_str(r#"{"prior_bot_rate": 0.3, "w_hdr": 2.5}"#).unwrap();
-        assert_eq!(cfg, RouterConfig { prior_bot_rate: 0.3, w_hdr: 2.5, ..Default::default() });
+        let cfg: RouterConfig =
+            serde_json::from_str(r#"{"prior_bot_rate": 0.3, "w_hdr": 2.5}"#).unwrap();
+        assert_eq!(
+            cfg,
+            RouterConfig {
+                prior_bot_rate: 0.3,
+                w_hdr: 2.5,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

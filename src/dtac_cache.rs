@@ -1,13 +1,13 @@
 use crate::cache_engine::DtacCacheEngine;
 use crate::heuristic_router::HeuristicRouter;
 use crate::types::RequestData;
+use opentelemetry::global;
+use opentelemetry::metrics::{Counter, Histogram};
 use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use opentelemetry::global;
-use opentelemetry::metrics::{Counter, Histogram};
 use std::time::Instant;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 /// Combined DTAC component containing both the Cache Engine and Heuristic Router
 #[derive(Debug)]
@@ -42,9 +42,18 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
         Self {
             engine,
             router,
-            hits_counter: meter.u64_counter("dtac.cache.hits").with_description("Number of cache hits").init(),
-            misses_counter: meter.u64_counter("dtac.cache.misses").with_description("Number of cache misses").init(),
-            processing_time: meter.f64_histogram("dtac.request.duration").with_description("Processing time for a request in seconds").init(),
+            hits_counter: meter
+                .u64_counter("dtac.cache.hits")
+                .with_description("Number of cache hits")
+                .init(),
+            misses_counter: meter
+                .u64_counter("dtac.cache.misses")
+                .with_description("Number of cache misses")
+                .init(),
+            processing_time: meter
+                .f64_histogram("dtac.request.duration")
+                .with_description("Processing time for a request in seconds")
+                .init(),
         }
     }
 
@@ -64,7 +73,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
         Fut: Future<Output = P>,
     {
         let start_time = Instant::now();
-        
+
         debug!("Processing request for resource");
 
         // Calculate the score proxying for AI-Score
@@ -72,18 +81,21 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
             Ok(score) => score.value() as f32,
             Err(_) => 0.5, // fallback if evaluation fails
         };
-        
+
         // Track whether it was a hit or miss
         let mut was_hit = true;
-        
+
         // Use the score in the caching engine
-        let result = self.engine.access(requested_resource, request_bot_prob, |k| {
-            was_hit = false;
-            fetch_from_origin(k)
-        }).await;
-        
+        let result = self
+            .engine
+            .access(requested_resource, request_bot_prob, |k| {
+                was_hit = false;
+                fetch_from_origin(k)
+            })
+            .await;
+
         let duration = start_time.elapsed().as_secs_f64();
-        
+
         if was_hit {
             self.hits_counter.add(1, &[]);
             debug!("Cache hit");
@@ -91,16 +103,16 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
             self.misses_counter.add(1, &[]);
             debug!("Cache miss");
         }
-        
+
         self.processing_time.record(duration, &[]);
-        
+
         info!(
             hit = was_hit,
             bot_prob = request_bot_prob,
             duration_sec = duration,
             "Request processed"
         );
-        
+
         result
     }
 }

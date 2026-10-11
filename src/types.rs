@@ -1,7 +1,7 @@
 //! Module containing common data structures and types used in DTAC.
 
-use std::net::IpAddr;
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 /// Represents the incoming request data needed by the router and cache.
 #[derive(Debug, Clone)]

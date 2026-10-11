@@ -3,12 +3,12 @@
 //! This module provides the core caching engine that manages cache entries
 //! dynamically based on traffic patterns and heuristic AI scoring.
 
-use std::collections::hash_map::DefaultHasher;
+use rand::Rng;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::time::Instant;
-use rand::Rng;
 
 /// The number of independent mutex locks used for lock sharding.
 pub const NUM_SHARDS: usize = 256;
@@ -75,11 +75,11 @@ impl<K: Eq + Hash + Clone, P: Clone> CacheShard<K, P> {
         for _ in 0..N_SAMPLES {
             let idx = rng.gen_range(0..self.entries.len());
             let (_, entry) = &self.entries[idx];
-            
+
             let dt = current_time
                 .duration_since(entry.meta.last_accessed)
                 .as_secs();
-            
+
             // Time-Decay (Bitwise Shift approximation for floats)
             // If delta time is large enough, score naturally decays toward zero.
             let current_decayed_score = if dt >= 32 {
@@ -169,7 +169,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     {
         // Phase 1: Concurrency Management (Lock Sharding)
         let shard_id = Self::get_shard_id(&requested_resource);
-        
+
         let (action, payload) = {
             let mut shard = self.shards[shard_id].lock().unwrap();
             let current_time = Instant::now();
@@ -197,7 +197,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
 
                 // Increment value is inversely proportional to AI-Score (request_bot_prob)
                 let new_score = decayed_score + (1.0 - request_bot_prob);
-                
+
                 meta.last_accessed = current_time;
                 meta.score = new_score;
 
@@ -259,18 +259,19 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
                 }
 
                 let idx = shard.entries.len();
-                shard.entries.push((requested_resource.clone(), MainCacheEntry {
-                    payload: payload.clone(),
-                    meta,
-                }));
+                shard.entries.push((
+                    requested_resource.clone(),
+                    MainCacheEntry {
+                        payload: payload.clone(),
+                        meta,
+                    },
+                ));
                 shard.main_cache_map.insert(requested_resource.clone(), idx);
                 shard.ghost_cache.remove(&requested_resource);
 
                 payload
-            },
-            Action::GhostHit | Action::Miss => {
-                fetch_from_origin(&requested_resource).await
             }
+            Action::GhostHit | Action::Miss => fetch_from_origin(&requested_resource).await,
         }
     }
 }

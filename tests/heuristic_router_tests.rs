@@ -2,8 +2,8 @@
 
 use dtac::heuristic_router::HeuristicRouter;
 use dtac::types::RequestData;
-use std::net::IpAddr;
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 #[tokio::test]
 async fn test_heuristic_router_new() {
@@ -17,22 +17,21 @@ async fn test_heuristic_router_evaluate_request() {
     let ip: IpAddr = "192.168.1.1".parse().unwrap();
     let mut headers = HashMap::new();
     headers.insert("accept-language".to_string(), "en-US".to_string());
-    
+
     let req = RequestData {
         ip_address: ip,
         path: "/api/test".to_string(),
         method: "GET".to_string(),
         headers,
     };
-    
+
     let score_result = router.evaluate_request(&req).await;
     assert!(score_result.is_ok());
     let score = score_result.unwrap();
-    
+
     // Check that value is within limits
     assert!(score.value() >= 0.0 && score.value() <= 1.0);
 }
-
 
 mod asn_and_shy_guys {
     #![allow(clippy::unwrap_used)]
@@ -92,19 +91,35 @@ mod asn_and_shy_guys {
         let db = fixture_db();
         assert!(db.v4_range_count() > 0);
         assert!(db.v6_range_count() > 0);
-        for dc in ["45.33.12.4", "104.248.33.44", "167.172.9.201", "2600:3c01::1"] {
+        for dc in [
+            "45.33.12.4",
+            "104.248.33.44",
+            "167.172.9.201",
+            "2600:3c01::1",
+        ] {
             assert!(db.is_datacenter(&ip(dc)), "{dc} should be a datacenter IP");
         }
-        for not_dc in ["198.51.100.23", "203.0.113.14", ISP_IP, "86.1.2.3", "2a02:c7d::1"] {
-            assert!(!db.is_datacenter(&ip(not_dc)), "{not_dc} should not be a datacenter IP");
+        for not_dc in [
+            "198.51.100.23",
+            "203.0.113.14",
+            ISP_IP,
+            "86.1.2.3",
+            "2a02:c7d::1",
+        ] {
+            assert!(
+                !db.is_datacenter(&ip(not_dc)),
+                "{not_dc} should not be a datacenter IP"
+            );
         }
     }
 
     #[test]
     fn separate_v4_and_v6_files_are_merged() {
         let text = std::fs::read_to_string(fixture_path()).unwrap();
-        let (v6_rows, v4_rows): (Vec<&str>, Vec<&str>) =
-            text.lines().filter(|l| !l.starts_with('#')).partition(|l| l.contains(':'));
+        let (v6_rows, v4_rows): (Vec<&str>, Vec<&str>) = text
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .partition(|l| l.contains(':'));
 
         let dir = std::env::temp_dir().join(format!("dtac-asn-merge-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -158,7 +173,10 @@ mod asn_and_shy_guys {
         let under_threshold = last_score(&router, "10.0.0.3", &pages[..4]).await;
 
         assert!(b > a, "shy IP {b} should exceed favicon IP {a}");
-        assert!((under_threshold - a).abs() < 1e-12, "4 pages must not be flagged");
+        assert!(
+            (under_threshold - a).abs() < 1e-12,
+            "4 pages must not be flagged"
+        );
     }
 
     #[tokio::test]
@@ -171,7 +189,10 @@ mod asn_and_shy_guys {
 
     #[tokio::test]
     async fn even_prior_reproduces_original_scores() {
-        let config = RouterConfig { prior_bot_rate: 0.5, ..Default::default() };
+        let config = RouterConfig {
+            prior_bot_rate: 0.5,
+            ..Default::default()
+        };
         let router = HeuristicRouter::with_config(config, AsnDatabase::empty()).unwrap();
 
         let clean = score(&router, &human_request(ISP_IP, "/item/1")).await;
@@ -185,7 +206,10 @@ mod asn_and_shy_guys {
 
     #[test]
     fn invalid_config_is_rejected() {
-        let config = RouterConfig { prior_bot_rate: 1.5, ..Default::default() };
+        let config = RouterConfig {
+            prior_bot_rate: 1.5,
+            ..Default::default()
+        };
         assert!(HeuristicRouter::with_config(config, AsnDatabase::empty()).is_err());
     }
 }
