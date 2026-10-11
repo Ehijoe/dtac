@@ -2,6 +2,10 @@
 
 benchmark_logs/
 
+# Full iptoasn.com downloads are large; only the small test fixture is committed.
+data/asn/*
+!data/asn/ip2asn-fixture.tsv
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

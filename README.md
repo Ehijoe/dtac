@@ -31,13 +31,24 @@ DTAC (`src/dtac_cache.rs`) composes two independently-testable halves:
 (logistic-regression-style) model: start from a baseline prior, add weighted contributions from a
 few independent heuristics, then squash through a sigmoid into a `[0, 1]` bot score (`AiScore`):
 
+- **Prior**: the baseline log-odds `l_0 = ln(p / (1 − p))` comes from an explicit assumed bot base
+  rate `prior_bot_rate` (default `0.1`, so `l_0 ≈ −2.20`): "assume human until the evidence says
+  otherwise". A clean human request scores `bot_prob ≈ 0.1`.
 - **Velocity**: per-IP request rate, tracked as a fixed-point EWMA with bitwise-shift decay. A
-  graded penalty kicks in once an IP's rate crosses `BURST_THRESHOLD`.
-- **ASN**: flags datacenter/hosting-provider IPs. Currently a stub (`AsnDatabase::is_datacenter`
-  always returns `false`) — real ASN lookup isn't implemented.
-- **"Shy guys"**: meant to penalize IPs that never fetch auxiliary assets like browsers do. The
-  flag exists on `IpState` but nothing currently sets it to `true` — effectively dead for now.
+  graded penalty `alpha · ln(velocity / burst_threshold)` kicks in once an IP's rate crosses
+  `burst_threshold`.
+- **ASN**: flags datacenter/hosting-provider IPs. `AsnDatabase` (`asn_db.rs`) loads iptoasn.com
+  `ip2asn` TSV ranges and binary-searches them (`O(log n)`), then checks the ASN against a curated
+  list of hosting/cloud providers (`DEFAULT_DATACENTER_ASNS`, overridable). With no database
+  loaded (the default), the heuristic never fires.
+- **"Shy guys"**: penalizes IPs that have made `shy_page_threshold` (default 5) page requests and
+  have *never* fetched an auxiliary asset (favicon, CSS, JS, images, fonts). Browsers fetch those
+  once and then cache them, so "never" rather than "not since the last page" is the signal; the
+  threshold is a grace period so short human visits aren't penalized.
 - **Headers**: penalizes requests missing an `Accept-Language` header.
+
+All weights and thresholds live in `RouterConfig` (`config.rs`), which deserializes from JSON so
+every constant can be changed without recompiling (see `replay_bench --router-config`).
 
 Per-IP state is tracked in `SpaceSaver` (`space_saver.rs`), a bounded-memory structure (the
 SpaceSaver/Stream-Summary algorithm) so the router's memory use doesn't grow unbounded with
@@ -69,12 +80,15 @@ resource key) to reduce lock contention. Each shard runs:
 
 ```
 src/
-  heuristic_router/   bot-score computation (velocity, ASN stub, header heuristics)
+  heuristic_router/   bot-score computation (velocity, ASN, "shy guys", header heuristics)
   cache_engine/        sharded randomized-eviction cache with ghost-cache admission
   dtac_cache.rs        combines the two + telemetry
   bin/
     dtac_standalone.rs reverse-proxy binary
     replay_bench.rs    benchmark replay tool (DTAC vs. a standard-LRU baseline)
+    common/            CLI flags shared by both binaries (ASN database loading)
+data/asn/
+  ip2asn-fixture.tsv   small committed ip2asn fixture for tests/benchmarks (full downloads gitignored)
 scripts/
   generate_logs.py     synthetic traffic generator
   test_generate_logs.py
@@ -110,9 +124,34 @@ exposing Prometheus metrics at `/metrics`. The client's real peer IP (via `Conne
 router's per-IP heuristics; it does not parse `X-Forwarded-For`, so put a trusted reverse proxy in
 front of it if you need that.
 
-Only `--capacity`, `--target`, and `--port` currently do anything — `--sketch-k`, `--cm-depth`, and
+To enable the datacenter-ASN heuristic, pass one or more ip2asn files (see
+[ASN data](#asn-data)):
+
+```bash
+cargo run --bin dtac_standalone -- --asn-db data/asn/ip2asn-v4.tsv --asn-db data/asn/ip2asn-v6.tsv
+```
+
+| Flag | Meaning |
+|---|---|
+| `--asn-db <PATH>` | iptoasn `ip2asn` TSV (v4, v6 or combined). Repeatable; files are merged. Without it, the ASN heuristic never fires |
+| `--datacenter-asns <PATH>` | One ASN per line (`AS` prefix and `#` comments allowed), replacing the built-in datacenter list. Requires `--asn-db` |
+
+Only `--capacity`, `--target`, `--port` and the ASN flags currently do anything — `--sketch-k`, `--cm-depth`, and
 `--cm-width` are accepted but unused (vestigial from an earlier Count-Min-Sketch design; the router
 actually uses the `SpaceSaver` structure described above, which takes no such parameters).
+
+### ASN data
+
+The repository ships only `data/asn/ip2asn-fixture.tsv`, a tiny fixture in real ip2asn format.
+For real lookups, download the public-domain data from <https://iptoasn.com/data/>: either
+`ip2asn-v4.tsv.gz` **and** `ip2asn-v6.tsv.gz`, or `ip2asn-combined.tsv.gz`. Gunzip them into
+`data/asn/` (ignored by git) and pass each file with `--asn-db`.
+
+The fixture's datacenter rows were written to cover the generator's own datacenter bot IPs
+(`45.33.*`, `104.248.*`, `167.172.*`); its TEST-NET bot IPs (`198.51.100.*`, `203.0.113.*`) are
+deliberately left unmatched. **ASN detection in the benchmark is therefore true by construction:**
+it shows the plumbing works and how much a correct ASN signal helps the cache, not that ASN
+detection works on real traffic.
 
 ## Benchmarking
 
@@ -172,6 +211,14 @@ dispatched.
 | `-s, --payload-size <BYTES>` | `1024` | Simulated payload size returned on a miss |
 | `--speed <MULTIPLIER>` | `10000.0` | Playback speed relative to logged timestamps. `1.0` = realtime (needed for the router's per-IP velocity heuristic to see a faithful cadence); higher replays faster. Defaults fast so iteration stays quick |
 | `-a, --algorithm <dtac\|lru>` | `dtac` | Which cache engine to drive: DTAC's bot-aware engine, or a standard bot-unaware sharded LRU baseline (same shard count/capacity math as DTAC, for a fair comparison) |
+| `--asn-db <PATH>` | *(none)* | iptoasn `ip2asn` TSV for the datacenter-ASN heuristic. Repeatable; files are merged. E.g. `--asn-db data/asn/ip2asn-fixture.tsv` |
+| `--datacenter-asns <PATH>` | *(built-in list)* | One ASN per line, replacing the default datacenter list. Requires `--asn-db` |
+| `--router-config <PATH>` | *(defaults)* | JSON object of `RouterConfig` fields (`prior_bot_rate`, `w_asn`, `w_fav`, `w_hdr`, `burst_threshold`, `alpha`, `shy_page_threshold`); omitted fields keep their defaults, unknown fields are rejected |
+| `--prior-bot-rate <P>` | `0.1` | Router prior bot rate in `(0, 1)`; overrides the value from `--router-config`. `0.5` reproduces the original zero prior |
+
+The effective router configuration is printed at startup. Setting `RUST_LOG` (e.g.
+`RUST_LOG=dtac=info`) prints per-request router decisions to stderr; leave it unset for
+throughput measurements.
 
 #### Comparing DTAC against the LRU baseline
 
@@ -193,6 +240,10 @@ priority order:
 ## Benchmark results
 
 All runs below: `--capacity 10000`, default `--speed`, on the warm-up-aware logs described above.
+
+> **These results predate plans 001–004** (working ASN and "Shy Guys" heuristics, the non-zero
+> router prior, simulated time, new workloads) and will be replaced once those land. They were
+> produced with the original zero prior and with the ASN and "Shy Guys" heuristics inactive.
 
 ### Human hit rate (primary metric) — DTAC vs. standard LRU
 
@@ -226,8 +277,10 @@ All runs below: `--capacity 10000`, default `--speed`, on the warm-up-aware logs
   on anything this project is actually trying to optimize.
 - **Why warm-up matters**: without it, DTAC's human hit rate measured ~5 points *lower* than LRU's
   across the board. That gap was a structural cold-start artifact, not a real weakness: DTAC's
-  ghost-cache admission requires two prior misses (`score >= PROMOTION_THRESHOLD = 2.0`, and each
-  human hit only adds `1.0 - bot_prob ≈ 1.0`) before any resource can register a hit, versus plain
+  ghost-cache admission needs several human requests before a resource enters the main cache —
+  each adds `1 − bot_prob_human` to its score and promotion requires `PROMOTION_THRESHOLD`, so it
+  takes `ceil(PROMOTION_THRESHOLD / (1 − bot_prob_human))` requests (4 under the original zero
+  prior, where `bot_prob_human = 0.5`; 3 under the current default prior of `0.1`) — versus plain
   LRU inserting directly into the cache on the very first miss. A short, cold-cache benchmark run
   pays that one-time admission tax disproportionately; warming the cache first (and excluding that
   warm-up traffic from the measured numbers) reveals the actual steady-state behavior, which is
@@ -239,10 +292,13 @@ the four `traffic_mixed_*pct_bot.ndjson` files.
 
 ## Known limitations
 
-- **ASN heuristic is a stub** (`AsnDatabase::is_datacenter` always returns `false`) — real
-  datacenter/hosting-provider IP lookup isn't implemented.
-- **"Shy guys" (missing-asset) heuristic is dead code** — `IpState.missing_auxiliary_assets` is
-  read but never set to `true` anywhere, so it never contributes to the bot score today.
+- **The "Shy guys" heuristic is trivially evaded** — it is IP-level, so a bot that fetches a single
+  favicon (or any asset) once per IP is never flagged again.
+- **The datacenter ASN list is curated, not complete** — `DEFAULT_DATACENTER_ASNS` covers major
+  cloud/hosting providers only; bots on residential proxies or unlisted hosts are not caught. The
+  benchmark's ASN signal is true by construction (see [ASN data](#asn-data)).
+- **NAT / shared IPs** — all per-IP heuristics (velocity, "Shy guys") treat every client behind one
+  address as a single client, so a busy NAT can look like a bot and a bot can hide among humans.
 - **`dtac_standalone` doesn't parse `X-Forwarded-For`/`X-Real-IP`** — it uses the direct TCP peer
   address only. Deploying behind a reverse proxy without trusted-header handling means every
   request will appear to come from the proxy's IP, defeating the per-IP heuristics.
@@ -276,12 +332,12 @@ thesis describes something worth building.
 | 2 | Scoring runs in O(1) (Ch1 obj. 2, scope, §2.4, §2.8, Alg. 1 line 5, §3.7.3) | `SpaceSaver` uses two `BTreeSet`s → O(log K) per request with fixed K | Fix text (or implement O(1) stream-summary buckets) |
 | 3 | SpaceSaver uses "O(1) space" (§3.4.1) | O(K) space, bounded by `capacity` | Fix text |
 | 4 | Strict bounded memory everywhere (scope §1.4.2) | Ghost cache is an unbounded `HashMap` | Implement (bound the ghost cache) |
-| 5 | "Shy Guys" favicon heuristic heavily penalizes sessions (§3.2.2, §3.4.1, Alg. 1 heuristic C) | `missing_auxiliary_assets` is never set to `true` — heuristic never fires | Implement |
-| 6 | Cross-references datacenter ASN databases (§3.4.1, Alg. 1 heuristic B) | `AsnDatabase::is_datacenter` always returns `false` | Implement or disclose as stub |
+| 5 | "Shy Guys" favicon heuristic heavily penalizes sessions (§3.2.2, §3.4.1, Alg. 1 heuristic C) | Flags an IP after `shy_page_threshold` (default 5) page requests with no auxiliary-asset fetch ever | Done |
+| 6 | Cross-references datacenter ASN databases (§3.4.1, Alg. 1 heuristic B) | Offline iptoasn `ip2asn` lookup + curated datacenter-ASN list (`--asn-db`); benchmark uses a fixture that matches the generator's bot IPs by construction | Done |
 | 7 | Penalties for "missing or misordered headers", `Sec-CH-UA`, User-Agent (§3.4.1, §3.5.2) | Only checks presence of `Accept-Language` | Fix text (or implement more header checks) |
-| 8 | Weights are log-likelihood ratios `W_i = ln(P(E|Bot)/P(E|Human))`, "Naive Bayes" (§3.4.1, §3.4.3) | Hand-picked constants `w_asn=1.5`, `w_fav=1.2`, `w_hdr=1.0`; hand-weighted log-odds model | Fix text (or estimate weights from data) |
+| 8 | Weights are log-likelihood ratios `W_i = ln(P(E|Bot)/P(E|Human))`, "Naive Bayes" (§3.4.1, §3.4.3) | Hand-picked defaults `w_asn=1.5`, `w_fav=1.2`, `w_hdr=1.0` (configurable via `RouterConfig`); hand-weighted log-odds model. The prior is now an explicit, documented base rate (`prior_bot_rate = 0.1`, `l_0 = ln(p/(1−p))`) | Fix text (or estimate weights from data) |
 | 9 | `ln` approximated with base-2 integer log / bit counting (§3.4.1 note) | Uses `f64::ln()` | Fix text (delete the note) |
-| 10 | Recommended `v_τ = 15–30`, `α = 2.5–3.0` (§3.4.3) | `BURST_THRESHOLD = 10.0`, `ALPHA = 2.0` | Fix text or change constants |
+| 10 | Recommended `v_τ = 15–30`, `α = 2.5–3.0` (§3.4.3) | `burst_threshold = 10.0`, `alpha = 2.0` (`RouterConfig` defaults) | Fix text or change constants |
 | 11 | Derives `N = 14` as the default sample size (§3.4.3) | `N_SAMPLES = 5` | Pick one; make text and code agree |
 | 12 | Eviction overhead "drops to zero" (§3.4.2) | O(N) per eviction | Fix text |
 | 13 | Score appended as `X-Bot-Probability` header and forwarded to a separate cache (§3.2.3, §3.4.1) | Single process; `DtacCache::access` passes the score directly in memory | Fix text |
@@ -307,8 +363,11 @@ thesis describes something worth building.
 
 - [x] Log-odds bot scorer with sigmoid output in `[0, 1]` (`HeuristicRouter::evaluate_request`)
 - [x] Per-IP fixed-point EWMA velocity with bitwise-shift decay
-- [x] Graded logarithmic velocity penalty above `BURST_THRESHOLD`
+- [x] Graded logarithmic velocity penalty above `burst_threshold`
 - [x] `Accept-Language` header heuristic
+- [x] "Shy Guys" heuristic: `missing_auxiliary_assets` set from per-IP page vs. auxiliary-asset fetch history
+- [x] Real datacenter ASN lookup (offline iptoasn `ip2asn` database), with a fixture covering the generator's datacenter-range bot IPs so it is exercised
+- [x] Configurable router constants (`RouterConfig`, `--router-config`) with an explicit prior bot rate
 - [x] Bounded-memory per-IP state via SpaceSaver (evict-min, count inheritance, half-life decay)
 - [x] 256-way lock-sharded cache engine
 - [x] Metadata-only ghost cache with promotion at `PROMOTION_THRESHOLD = 2.0`
@@ -328,7 +387,6 @@ thesis describes something worth building.
 
 - [ ] Ablation run: DTAC with `bot_prob` forced to `0` — separates the effect of the AI score from the effect of ghost-cache admission alone
 - [ ] Scan-resistant baselines: SIEVE and/or S3FIFO (Ch. 2 cites them as already strong under scans; beating only LRU is a weak claim)
-- [ ] "Shy Guys" heuristic: set `missing_auxiliary_assets` from per-IP page vs. `/favicon.ico` fetch history
 - [ ] Bound the ghost cache (e.g. per-shard cap with FIFO eviction, as in S3FIFO's ghost queue)
 - [ ] Drive time-based logic from log timestamps (or report results at `--speed 1.0`) so decay and velocity behave as designed
 - [ ] Repeated runs with different seeds, reporting mean ± spread
@@ -336,7 +394,6 @@ thesis describes something worth building.
 - [ ] Memory measurement (peak RSS or structure sizes) for DTAC vs. LRU
 - [ ] Eviction logging by origin (human vs. bot) and a Cache Pollution Index (share of main-cache entries first admitted by bot-scored requests)
 - [ ] Variable payload sizes in the generator, so Byte Hit Rate means something (or drop BHR)
-- [ ] Real datacenter ASN lookup (e.g. an offline ASN database), plus datacenter-range bot IPs in the generator so it is exercised
 - [ ] Optional: networked benchmark through `dtac_standalone` to match the thesis's "over localhost" setup
 - [ ] Optional: "stealthy bot" workload (headers present, rotating IPs, jittered timing) to show where the heuristics stop working
 
@@ -346,7 +403,7 @@ From Ch. 1 §1.3.2:
 
 | Objective | Status | Notes |
 |---|---|---|
-| 1. Lightweight passive heuristic detector using HTTP header anomalies and structural requests | **Partially achieved** | Velocity and `Accept-Language` work. The structural (favicon) heuristic is not wired up and ASN is a stub. Achievable: the favicon heuristic is a small change. |
+| 1. Lightweight passive heuristic detector using HTTP header anomalies and structural requests | **Achieved (synthetic evaluation)** | Velocity, `Accept-Language`, the structural ("Shy Guys") heuristic and datacenter-ASN lookup all work. Caveats: the benchmark's ASN fixture matches the generator's bot IPs by construction, and the current workload cannot produce a "Shy Guys" false positive; classifier metrics on realistic sessions (plan 003) are needed before calling it plainly achieved. |
 | 2. Real-time continuous AI-score in `[0, 1]` in O(1) | **Achieved except the O(1) claim** | The score is continuous and computed per request. Cost is O(log K) because of the `BTreeSet`s. True O(1) is possible with a stream-summary bucket list, but the half-life count decay makes it hard. Most practical route: reword to "bounded O(log K), independent of traffic volume". |
 | 3. DTAC that modifies LRU eviction using the AI-score | **Achieved in substance, not as worded** | The AI-score does drive admission and eviction, but the design is not a modified LRU. Reword the objective rather than rebuilding to match it. |
 | 4. Benchmark DTAC hit rates against standard LRU under simulated mixed workloads | **Achieved (basic version)** | Human hit rate: DTAC ≥ LRU at every ratio, +5.5 points at 75% bots. Missing: ablation, SIEVE/S3FIFO baselines, repeated runs. The 50% ratio is a tie. |

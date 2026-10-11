@@ -1,0 +1,14 @@
+# Small ip2asn-format fixture for offline tests and benchmarks (not real routing data).
+# Format (tab-separated): range_start  range_end  AS_number  country_code  AS_description
+# Datacenter rows cover the generator's BOT_IP_POOL datacenter IPs (45.33.*, 104.248.*, 167.172.*);
+# the TEST-NET bot IPs (198.51.100.*, 203.0.113.*) are intentionally left unmatched.
+# Because the fixture was written to match the generator, ASN detection in the benchmark is
+# true by construction. It is not evidence that ASN detection works on real traffic.
+0.0.0.0	0.255.255.255	0	None	Not routed
+24.0.0.0	24.15.255.255	7922	US	COMCAST-7922
+45.33.0.0	45.33.127.255	63949	US	AKAMAI-LINODE-AP Akamai Connected Cloud
+86.0.0.0	86.31.255.255	5089	GB	NTL Virgin Media Limited
+104.248.0.0	104.248.255.255	14061	US	DIGITALOCEAN-ASN
+167.172.0.0	167.172.255.255	14061	US	DIGITALOCEAN-ASN
+2600:3c00::	2600:3c03:ffff:ffff:ffff:ffff:ffff:ffff	63949	US	AKAMAI-LINODE-AP Akamai Connected Cloud
+2a02:c7c::	2a02:c7f:ffff:ffff:ffff:ffff:ffff:ffff	5089	GB	NTL Virgin Media Limited

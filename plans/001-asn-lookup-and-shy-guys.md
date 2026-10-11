@@ -1,6 +1,6 @@
 # Plan 001 — Real ASN datacenter lookup + "Shy Guys" heuristic + configurable router prior
 
-**Status:** not started
+**Status:** implemented on branch `feat/001-asn-lookup-and-shy-guys` (see Implementation notes at the end)
 
 ## Context
 
@@ -240,3 +240,26 @@ false-positive rate is then reported through 003's router classifier metrics.
    and `is_datacenter=true` appears only for `45.33.*`, `104.248.*` and `167.172.*`.
 6. Smoke-test `dtac_standalone --asn-db data/asn/ip2asn-fixture.tsv`: it starts and logs the number of
    ranges loaded.
+
+---
+
+## Implementation notes
+
+- A `--datacenter-asns` file is strict: a malformed line is an error, unlike `ip2asn` rows, which are skipped
+  with a warning. It is hand-written config, so a typo should fail loudly. clap rejects it without `--asn-db`.
+- `RouterConfig` JSON uses `#[serde(default, deny_unknown_fields)]`, so a partial file works and a misspelled
+  field is rejected. `replay_bench` prints the effective config at startup. It also installs a stderr
+  `tracing` subscriber only when `RUST_LOG` is set, which verification step 5 needs.
+- Verification step 4 result (75% bot log, 3 runs each):
+  - **Bot hit rate did not fall with `--asn-db`.** It was ~4.0% both with and without the flag. At the default
+    `--speed 10000`, the wall-clock velocity penalty plus the header and Shy Guys penalties already push every
+    bot's per-hit contribution near zero, so ASN adds nothing measurable. Re-check after plan 002's
+    simulated clock.
+  - `--prior-bot-rate 0.5` alone lands slightly below `main`: bot ~2.2% vs ~2.4%, human ~57.0% vs ~57.8%. Shy
+    Guys is now active.
+  - `--router-config '{"prior_bot_rate":0.5,"w_fav":0.0}'` matches `main` within run-to-run noise: human
+    56.8–58.3% vs 57.5–58.3%, bot 2.2–2.5% vs 2.3–2.5%.
+- Verification step 5 was confirmed on a measurement-phase slice:
+  - `is_datacenter=true` appears only for `45.33.*`, `104.248.*` and `167.172.*`.
+  - `missing_assets=true` first appears at `page_requests=5`, and no human IP is ever flagged.
+

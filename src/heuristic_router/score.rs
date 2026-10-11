@@ -23,7 +23,7 @@ impl AiScore {
     pub fn value(&self) -> f64 {
         self.value
     }
-    
+
     /// Determines whether the score indicates a high risk.
     ///
     /// Returns `true` if the score is greater than 85.0.
@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn test_is_high_risk() {
-        // Since new() clamps to 1.0, and is_high_risk checks > 85.0, 
+        // Since new() clamps to 1.0, and is_high_risk checks > 85.0,
         // it's currently always false under new().
         let score = AiScore::new(0.9);
         assert!(!score.is_high_risk());
