@@ -35,6 +35,8 @@ pub struct HeuristicRouter {
     w_fav: f64,
     /// Anomalous header log-likelihood weight (W_hdr)
     w_hdr: f64,
+    /// IP → ASN lookup used by the datacenter heuristic.
+    asn_db: AsnDatabase,
     /// Bounded-memory tracker for IP state.
     space_saver: SpaceSaver,
     
@@ -44,15 +46,27 @@ pub struct HeuristicRouter {
 }
 
 impl HeuristicRouter {
-    /// Creates a new `HeuristicRouter` with default weights.
+    /// Creates a new `HeuristicRouter` with default weights and an empty ASN database
+    /// (so the datacenter heuristic never fires).
     pub fn new() -> Self {
+        Self::build(AsnDatabase::empty())
+    }
+
+    /// Creates a router with default weights that flags datacenter IPs using `asn_db`.
+    pub fn with_asn_db(asn_db: AsnDatabase) -> Self {
+        Self::build(asn_db)
+    }
+
+    /// Shared constructor.
+    fn build(asn_db: AsnDatabase) -> Self {
         let meter = global::meter("dtac");
-        
-        Self { 
+
+        Self {
             l_0: 0.0,
             w_asn: 1.5,
             w_fav: 1.2,
             w_hdr: 1.0,
+            asn_db,
             space_saver: SpaceSaver::new(10000, 3600), // Default capacity 10000 IPs, 1 hour TTL
             eval_requests_counter: meter.u64_counter("dtac.router.evaluations").with_description("Number of requests evaluated by heuristic router").init(),
             eval_duration: meter.f64_histogram("dtac.router.eval_duration").with_description("Time spent evaluating a request in seconds").init(),
@@ -110,7 +124,7 @@ impl HeuristicRouter {
         }
 
         // Heuristic B: Infrastructure Origin (Datacenter ASN)
-        let is_datacenter = AsnDatabase::is_datacenter(&client_ip);
+        let is_datacenter = self.asn_db.is_datacenter(&client_ip);
         if is_datacenter {
             score += self.w_asn;
         }
@@ -149,3 +163,10 @@ impl HeuristicRouter {
         Ok(AiScore::new(bot_probability))
     }
 }
+
+impl Default for HeuristicRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+

@@ -15,6 +15,10 @@ pub enum DTACError {
     /// Error returned when the router configuration is invalid.
     #[error("Router configuration invalid: {0}")]
     ConfigError(String),
+
+    /// Error returned when an ASN database or ASN list cannot be read.
+    #[error("ASN database error: {0}")]
+    AsnDbError(String),
 }
 
 /// A specialized `Result` type for DTAC operations.
