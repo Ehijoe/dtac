@@ -43,7 +43,8 @@ cargo test <test_name>      # run a single test by name (substring match)
 cargo clippy                # lint — this repo enables pedantic+nursery+cargo clippy lint groups
 ```
 
-Integration tests live in `tests/cache_engine_tests.rs` and `tests/heuristic_router_tests.rs`; unit
+Integration tests live in `tests/cache_engine_tests.rs`, `tests/heuristic_router_tests.rs` and
+`tests/dtac_cache_tests.rs`; unit
 tests live inline in `#[cfg(test)]` modules within the source files they test (e.g.
 `src/heuristic_router/score.rs`, `src/heuristic_router/space_saver.rs`).
 
@@ -51,9 +52,10 @@ tests live inline in `#[cfg(test)]` modules within the source files they test (e
 
 `Cargo.toml` turns on `clippy::pedantic`, `clippy::nursery`, and `clippy::cargo` as warnings, plus
 `unsafe_code = "forbid"` and `missing_docs = "warn"`. New public items need doc comments;
-`unwrap()`/`expect()` are warned on (`clippy::unwrap_used`, `clippy::expect_used`) — existing code
-has some pre-existing violations (e.g. mutex locks, `tokio::net::TcpListener::bind(...).await.unwrap()`
-in the standalone binary) that are not yet cleaned up.
+`unwrap()`/`expect()` are warned on (`clippy::unwrap_used`, `clippy::expect_used`) outside tests
+(`clippy.toml` allows them in test code). The tree is warning-free and CI runs clippy with
+`-D warnings`, so any new warning fails the build: lock mutexes with `crate::sync::lock`, propagate
+errors with `?` in the binaries, and put a justifying comment on any `#[allow(...)]`.
 
 ### Running the standalone proxy
 
@@ -111,7 +113,9 @@ weights/thresholds live in `RouterConfig` (`config.rs`, serde-deserializable, va
 
 - **Velocity heuristic**: per-IP request rate tracked as an EWMA using *bitwise right-shift* for
   exponential decay (not floating-point multiply) — `velocity >> delta_t`, fixed-point scaled by
-  1024. A graded penalty (`alpha * ln(velocity/burst_threshold)`) applies once velocity exceeds
+  1024. `delta_t` counts `velocity_tick_ms` tick boundaries crossed since `IpState.last_seen_ms`
+  (epoch-aligned, so sub-tick request streams still decay); beyond `velocity_reset_ticks` it resets.
+  A graded penalty (`alpha * ln(velocity/burst_threshold)`) applies once velocity exceeds
   `burst_threshold`.
 - **ASN heuristic** (`asn_db.rs`): `AsnDatabase` holds sorted v4 (`u32`) and v6 (`u128`) ranges
   parsed from iptoasn.com `ip2asn` TSV files and finds an IP's ASN via `partition_point` binary
@@ -135,7 +139,11 @@ minimum for eviction) and a time-ordered `BTreeSet` (to find stale entries to de
 IP arrives and memory is full, it evicts the lowest-count IP and the new IP *inherits* that evicted
 count + 1 — this is the standard SpaceSaver technique for bounding the undercount error on frequency
 estimates. Counts decay via a half-life exponential model (`2^(-elapsed/half_life)`), evaluated lazily
-on read rather than on a timer.
+on read rather than on a timer (half-life `space_saver_half_life_s`).
+
+All router time comes from an injected `Clock` (`src/clock.rs`, `Arc<dyn Clock>`) shared with its
+`SpaceSaver`: `SystemClock` by default, `ManualClock` via `HeuristicRouter::with_clock` for log
+replays and tests. Never read `SystemTime`/`Instant` directly for heuristic logic.
 
 `evaluate_request` is a two-phase read/mutate/write against `SpaceSaver`
 (`get_or_add_and_evict` then `update`) — not a single atomic operation. Callers modifying this logic
@@ -149,26 +157,38 @@ shard independently runs the same algorithm:
 
 - **Ghost cache**: metadata-only (no payload) tracking for resources not currently in the main cache.
   Every miss first lands here rather than immediately entering the main cache — this prevents one-off/
-  scan traffic from evicting genuinely popular resources ("cold-start mitigation").
+  scan traffic from evicting genuinely popular resources ("cold-start mitigation"). Stored densely
+  like the main cache (`ghost_map: HashMap<K, usize>` + `ghost_entries: Vec<(K, Metadata)>`) and
+  bounded at `capacity_per_shard * ghost_multiplier`; a miss into a full ghost first runs the same
+  tournament as the main cache (bot-inserted entries score ≈ 0 and lose first).
 - **Promotion**: a ghost-cache entry is promoted into the main cache (fetching the real payload) once
-  its score crosses `PROMOTION_THRESHOLD`.
+  its score crosses `promotion_threshold` (default `PROMOTION_THRESHOLD`). The ghost entry is removed
+  only when the promotion commits; it may already have been evicted by then, which is fine.
 - **Scoring**: each hit increases a resource's EWMA score by `(1.0 - request_bot_prob)` — i.e. human
   requests (`bot_prob` near 0) contribute close to a full point, bot-like requests (`bot_prob` near 1)
   contribute close to nothing. This is the core mechanism connecting router output to cache behavior.
-  Scores decay the same bitwise-shift-style way as router velocity, keyed off wall-clock `Instant`.
-- **Eviction**: `execute_eviction_tournament` samples `N_SAMPLES` (5) random entries from the shard's
-  dense `entries` vec and evicts whichever has the lowest *currently decayed* score (not the lowest
-  stored score) — a randomized approximation of LFU/LRU that avoids maintaining a full priority queue.
-  Removal uses `Vec::swap_remove` for O(1) removal, which requires fixing up the moved entry's index in
-  `main_cache_map` afterward.
+  `Metadata.last_accessed` is `u64` milliseconds on the engine's injected `Clock`;
+  `Metadata::decayed_score` halves the score once per whole `decay_half_life_ms` and zeroes it after
+  `decay_cutoff_half_lives`.
+- **Eviction**: the free function `tournament_victim` samples `n_samples` (default 5) random entries
+  from a dense `(key, meta)` slice and picks the lowest *currently decayed* score (not the lowest
+  stored score), breaking ties on the oldest `last_accessed` — a randomized approximation of LFU/LRU
+  that avoids maintaining a full priority queue. Main and ghost caches share it, plus
+  `swap_remove_indexed`, which does the O(1) `Vec::swap_remove` and fixes up the moved entry's index
+  in the key → index map.
+
+All engine constants are in `EngineConfig` (`src/cache_engine/config.rs`, serde-deserializable,
+validated by `DtacCacheEngine::with_config`). Defaults reproduce the original hard-coded behaviour and
+are provisional until plan 004's calibration.
 
 `DtacCacheEngine::access` takes a `fetch_from_origin` closure and only calls it on an actual miss or
 promotion — hits and ghost-hits return without touching the closure. The lock is held only for the
 cache-state transition decision; the async `fetch_from_origin` call happens *outside* the lock
 (`Action` enum marks what to do after releasing it), so origin fetches never block other shard access.
 
-`DtacCache::builder(capacity).router(router).build()` is how a custom router is injected;
-`DtacCache::new(capacity)` is shorthand for the defaults.
+`DtacCache::builder(capacity).router(router).clock(clock).engine_config(cfg)?.build()` is how custom
+parts are injected; the builder passes one shared clock to both router and engine (the router's own
+clock if `.clock` isn't called). `DtacCache::new(capacity)` is shorthand for the defaults.
 
 ### Binaries (`src/bin/`)
 
@@ -178,9 +198,12 @@ cache-state transition decision; the async `fetch_from_origin` call happens *out
   `127.0.0.1` rather than extracted from the connection/`X-Forwarded-For` — this means the ASN and
   per-IP velocity heuristics are not meaningfully exercised when actually running this binary.
 - **`replay_bench.rs`**: in-process benchmark harness (see Benchmarking pipeline above). Deserializes
-  NDJSON into memory up front, then drives concurrent `DtacCache::access` calls via
-  `futures::stream::iter(...).for_each_concurrent`, tracking separate hit/miss counters for
+  NDJSON into memory up front, then dispatches `DtacCache::access` calls paced by logged timestamps
+  (scaled by `--speed`) as `JoinSet` tasks bounded by a semaphore (`--concurrency`), tracking separate hit/miss counters for
   `human`/`bot`-labeled records so cache effectiveness can be compared across bot-traffic ratios.
+  `--clock log` (default) sets a shared `ManualClock` to each record's timestamp before its access,
+  so `--speed` only affects run time; `--clock wall` reproduces the old wall-clock behaviour.
+  `--engine-config`/`--router-config` (JSON) and `--ghost-multiplier` set any constant.
 
 ### Observability
 

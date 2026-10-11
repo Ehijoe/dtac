@@ -105,4 +105,123 @@ async fn test_cache_engine_concurrent_promotion_no_orphans() {
         total_entries, total_mapped,
         "orphaned cache entry detected: entries={total_entries}, mapped_keys={total_mapped}"
     );
+
+    for (entries, mapped) in engine.debug_ghost_counts() {
+        assert_eq!(entries, mapped, "orphaned ghost entry detected");
+    }
+    assert_eq!(
+        engine.ghost_len(),
+        0,
+        "the promoted key must leave the ghost cache"
+    );
+}
+
+/// Engine behaviour driven by an injected [`ManualClock`] and a custom [`EngineConfig`].
+mod configured {
+    #![allow(clippy::unwrap_used)]
+
+    use dtac::cache_engine::DtacCacheEngine;
+    use dtac::cache_engine::config::EngineConfig;
+    use dtac::clock::ManualClock;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn engine(config: EngineConfig) -> (DtacCacheEngine<String, String>, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new(1_000_000));
+        let engine = DtacCacheEngine::with_config(1024, config, clock.clone()).unwrap();
+        (engine, clock)
+    }
+
+    async fn human_access(engine: &DtacCacheEngine<String, String>, key: &str) {
+        let _ = engine
+            .access(key.to_string(), 0.0, |_k| async { "payload".to_string() })
+            .await;
+    }
+
+    fn main_len(engine: &DtacCacheEngine<String, String>) -> usize {
+        engine.debug_integrity_counts().0
+    }
+
+    #[tokio::test]
+    async fn decay_follows_the_injected_clock() {
+        let (engine, clock) = engine(EngineConfig::default());
+        for _ in 0..5 {
+            human_access(&engine, "hot").await;
+        }
+        let key = "hot".to_string();
+        let fresh = engine.debug_score(&key).unwrap();
+        assert!(
+            fresh > 1.0,
+            "hot entry should have a high score, got {fresh}"
+        );
+
+        // No real time passes in this test, so only the manual clock can decay it.
+        clock.advance(Duration::from_secs(40));
+        assert!(engine.debug_score(&key).unwrap().abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn decay_half_life_is_respected() {
+        let (engine, clock) = engine(EngineConfig {
+            decay_half_life_ms: 10_000,
+            ..Default::default()
+        });
+        human_access(&engine, "item").await;
+        let key = "item".to_string();
+        assert!((engine.debug_score(&key).unwrap() - 1.0).abs() < f32::EPSILON);
+
+        clock.advance(Duration::from_millis(9_999));
+        assert!((engine.debug_score(&key).unwrap() - 1.0).abs() < f32::EPSILON);
+        clock.advance(Duration::from_millis(1));
+        assert!((engine.debug_score(&key).unwrap() - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn promotion_threshold_is_respected() {
+        let (default_engine, _) = engine(EngineConfig::default());
+        human_access(&default_engine, "item").await;
+        assert_eq!(main_len(&default_engine), 0);
+        human_access(&default_engine, "item").await;
+        assert_eq!(main_len(&default_engine), 1, "default threshold is 2 hits");
+
+        let (strict, _) = engine(EngineConfig {
+            promotion_threshold: 5.0,
+            ..Default::default()
+        });
+        for _ in 0..4 {
+            human_access(&strict, "item").await;
+        }
+        assert_eq!(main_len(&strict), 0);
+        human_access(&strict, "item").await;
+        assert_eq!(main_len(&strict), 1);
+    }
+
+    #[test]
+    fn invalid_config_is_rejected() {
+        let config = EngineConfig {
+            n_samples: 0,
+            ..Default::default()
+        };
+        let clock = Arc::new(ManualClock::default());
+        assert!(DtacCacheEngine::<String, String>::with_config(1024, config, clock).is_err());
+    }
+}
+
+#[tokio::test]
+async fn ghost_cache_stays_bounded_under_a_unique_key_scan() {
+    let engine = DtacCacheEngine::<String, ()>::new(1024);
+    let bound = engine.ghost_capacity_per_shard();
+    assert_eq!(bound, 4 * 4, "1024 / 256 shards * default multiplier 4");
+
+    for i in 0..100_000 {
+        engine.access(format!("scan-{i}"), 0.5, |_k| async {}).await;
+    }
+
+    for (shard, (entries, mapped)) in engine.debug_ghost_counts().into_iter().enumerate() {
+        assert_eq!(entries, mapped, "ghost index mismatch in shard {shard}");
+        assert!(entries <= bound, "shard {shard} holds {entries} > {bound}");
+    }
+    assert!(engine.ghost_len() <= bound * dtac::cache_engine::NUM_SHARDS);
+    let (total_entries, total_mapped) = engine.debug_integrity_counts();
+    assert_eq!(total_entries, total_mapped);
 }

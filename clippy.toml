@@ -1,0 +1,3 @@
+# Panicking on unexpected values is exactly what a failing test should do.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

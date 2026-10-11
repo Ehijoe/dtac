@@ -9,6 +9,7 @@ pub mod config;
 pub mod score;
 pub mod space_saver;
 
+use crate::clock::{Clock, SystemClock};
 use crate::error::Result;
 use crate::types::RequestData;
 use asn_db::AsnDatabase;
@@ -17,7 +18,8 @@ use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram};
 use score::AiScore;
 use space_saver::SpaceSaver;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, info, instrument};
 
 /// File extensions treated as auxiliary (non-page) assets by the "Shy Guys" heuristic.
@@ -40,6 +42,8 @@ pub struct HeuristicRouter {
     asn_db: AsnDatabase,
     /// Bounded-memory tracker for IP state.
     space_saver: SpaceSaver,
+    /// Time source for velocity and IP-count decay; shared with `space_saver`.
+    clock: Arc<dyn Clock>,
 
     // Telemetry
     eval_requests_counter: Counter<u64>,
@@ -73,15 +77,38 @@ impl HeuristicRouter {
         &self.config
     }
 
+    /// Makes this router read time from `clock` instead of the system clock.
+    ///
+    /// Use [`ManualClock`](crate::clock::ManualClock) to replay a log on its own
+    /// timestamps or to script time in tests.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.space_saver.set_clock(clock.clone());
+        self.clock = clock;
+        self
+    }
+
+    /// The clock this router reads time from.
+    pub const fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
     /// Shared constructor; `config` must already be valid.
     fn build(config: RouterConfig, asn_db: AsnDatabase) -> Self {
         let meter = global::meter("dtac");
+        let clock = SystemClock::shared();
 
         Self {
             l_0: config.prior_log_odds(),
+            // Default capacity 10000 IPs
+            space_saver: SpaceSaver::with_clock(
+                10000,
+                config.space_saver_half_life_s,
+                clock.clone(),
+            ),
+            clock,
             config,
             asn_db,
-            space_saver: SpaceSaver::new(10000, 3600), // Default capacity 10000 IPs, 1 hour TTL
             eval_requests_counter: meter
                 .u64_counter("dtac.router.evaluations")
                 .with_description("Number of requests evaluated by heuristic router")
@@ -91,14 +118,6 @@ impl HeuristicRouter {
                 .with_description("Time spent evaluating a request in seconds")
                 .init(),
         }
-    }
-
-    /// Helper to get current timestamp in seconds.
-    fn current_timestamp_seconds() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
     }
 
     /// Evaluates a request and assigns an AI score.
@@ -112,39 +131,49 @@ impl HeuristicRouter {
         debug!(ip = %req.ip_address, path = %req.path, "Evaluating incoming request");
 
         let client_ip = req.ip_address;
-        let current_time = Self::current_timestamp_seconds();
+        let now_ms = self.clock.now_millis();
 
         // --- PHASE 1: State Retrieval & Bounded Memory Management ---
-        let mut ip_state = self.space_saver.get_or_add_and_evict(client_ip).await;
+        let mut ip_state = self.space_saver.get_or_add_and_evict(client_ip);
 
         // --- PHASE 2: EWMA Velocity Calculation (Bitwise) ---
-        let delta_t = current_time.saturating_sub(ip_state.last_seen);
+        // Count tick boundaries crossed rather than whole ticks elapsed, so that a
+        // steady stream of requests closer together than one tick still decays.
+        let tick_ms = self.config.velocity_tick_ms;
+        let delta_t = (now_ms / tick_ms).saturating_sub(ip_state.last_seen_ms / tick_ms);
 
-        let new_velocity = if delta_t > 10 {
+        let new_velocity = if delta_t > self.config.velocity_reset_ticks {
             // Decayed to 0, plus 1 request (scaled by 1024)
             1024
         } else {
             // Bitwise right-shift for exponential decay
-            let decayed_v = ip_state.velocity >> delta_t;
-            decayed_v + 1024
+            let decayed_v = u32::try_from(delta_t)
+                .ok()
+                .and_then(|shift| ip_state.velocity.checked_shr(shift))
+                .unwrap_or(0);
+            decayed_v.saturating_add(1024)
         };
 
         // Commit updated state back to memory
-        ip_state.last_seen = current_time;
+        ip_state.last_seen = now_ms / 1000;
+        ip_state.last_seen_ms = now_ms;
         ip_state.velocity = new_velocity;
         ip_state.record_request(
             is_auxiliary_asset(&req.path),
             self.config.shy_page_threshold,
         );
-        self.space_saver.update(client_ip, ip_state.clone()).await;
+        self.space_saver.update(client_ip, ip_state);
 
         // --- PHASE 3: Log-Odds Heuristic Evaluation ---
         let mut score = self.l_0;
 
         // Heuristic A: Continuous Graded Velocity Penalty
-        let float_v = new_velocity as f64 / 1024.0;
+        let float_v = f64::from(new_velocity) / 1024.0;
         if float_v > self.config.burst_threshold {
-            score += self.config.alpha * (float_v / self.config.burst_threshold).ln();
+            score = self
+                .config
+                .alpha
+                .mul_add((float_v / self.config.burst_threshold).ln(), score);
         }
 
         // Heuristic B: Infrastructure Origin (Datacenter ASN)

@@ -13,14 +13,14 @@ impl AiScore {
     ///
     /// The provided value is automatically clamped to be within the
     /// range of `0.0` to `1.0` to ensure safe operation.
-    pub(crate) fn new(value: f64) -> Self {
+    pub(crate) const fn new(value: f64) -> Self {
         // Clamp between 0.0 and 1.0 for safety
         let clamped = value.clamp(0.0, 1.0);
         Self { value: clamped }
     }
 
     /// Returns the numerical value of the AI score.
-    pub fn value(&self) -> f64 {
+    pub const fn value(&self) -> f64 {
         self.value
     }
 
@@ -39,13 +39,13 @@ mod tests {
     #[test]
     fn test_new_score_clamping() {
         let score_low = AiScore::new(-5.0);
-        assert_eq!(score_low.value(), 0.0);
+        assert!(score_low.value().abs() < f64::EPSILON);
 
         let score_high = AiScore::new(105.0);
-        assert_eq!(score_high.value(), 1.0);
+        assert!((score_high.value() - 1.0).abs() < f64::EPSILON);
 
         let score_mid = AiScore::new(0.5);
-        assert_eq!(score_mid.value(), 0.5);
+        assert!((score_mid.value() - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
