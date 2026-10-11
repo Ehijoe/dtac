@@ -8,6 +8,18 @@ DTAC (Dynamic Traffic-Aware Cache) is a Rust library + standalone proxy binary t
 responses while weighting eviction/promotion decisions by an estimated bot probability ("AI-Score")
 for each request, so that human traffic is favored over scraper/bot traffic for cache residency.
 
+## Plans
+
+Plan-mode plans are stored in `plans/` (set via `plansDirectory` in `.claude/settings.json`). Plan
+files must be numbered so the order to apply them is clear:
+
+- Name each plan `NNN-short-descriptive-slug.md`, where `NNN` is a zero-padded, 3-digit number one
+  greater than the highest existing number in `plans/` (start at `001`).
+- Plan mode assigns a random filename while drafting. Once a plan is approved, rename it
+  (`mv plans/<random-name>.md plans/NNN-<slug>.md`) before starting implementation.
+- Apply plans in ascending numeric order. Never renumber an existing plan; if a plan is superseded,
+  note that at the top of the old file instead of deleting it.
+
 ## Commands
 
 Build/test commands assume a working Rust toolchain (`rustup default stable` if `cargo` reports no
