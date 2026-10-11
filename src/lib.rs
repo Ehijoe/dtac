@@ -4,6 +4,8 @@
 
 /// Contains the randomized caching algorithm considering AI scores.
 pub mod cache_engine;
+/// Injectable time source used by every time-based heuristic.
+pub mod clock;
 /// Defines the combined DTAC struct.
 pub mod dtac_cache;
 /// Defines the error types and results used across the library.
@@ -13,6 +15,7 @@ pub mod heuristic_router;
 /// Defines the common data structures and types used across the library.
 pub mod types;
 
+pub use clock::{Clock, ManualClock, SystemClock};
 pub use dtac_cache::{DtacCache, DtacCacheBuilder};
 pub use heuristic_router::HeuristicRouter;
 pub use heuristic_router::asn_db::AsnDatabase;
