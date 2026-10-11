@@ -1,9 +1,14 @@
 //! Replay script that doesn't make network requests for benchmarking
 
+mod common;
+
 use clap::Parser;
+use common::AsnArgs;
 use lru::LruCache;
 use dtac::cache_engine::NUM_SHARDS;
 use dtac::dtac_cache::DtacCache;
+use dtac::heuristic_router::HeuristicRouter;
+use dtac::heuristic_router::config::RouterConfig;
 use dtac::types::RequestData;
 use indicatif::{ProgressBar, ProgressStyle};
 use prometheus::{Encoder, TextEncoder};
@@ -64,6 +69,53 @@ struct Args {
     /// hit rates.
     #[arg(short = 'a', long, value_enum, default_value_t = Algorithm::Dtac)]
     algorithm: Algorithm,
+
+    #[command(flatten)]
+    asn: AsnArgs,
+
+    /// JSON file with `RouterConfig` fields; omitted fields keep their defaults.
+    #[arg(long, value_name = "PATH")]
+    router_config: Option<PathBuf>,
+
+    /// Router prior bot rate in (0, 1). Overrides `prior_bot_rate` from
+    /// `--router-config`; 0.5 reproduces the original zero prior.
+    #[arg(long, value_name = "P")]
+    prior_bot_rate: Option<f64>,
+}
+
+/// Builds the router from `--router-config`, `--prior-bot-rate` and the ASN flags.
+fn build_router(args: &Args) -> Result<HeuristicRouter, Box<dyn std::error::Error>> {
+    let mut config = match &args.router_config {
+        Some(path) => serde_json::from_reader(BufReader::new(File::open(path)?))?,
+        None => RouterConfig::default(),
+    };
+    if let Some(prior) = args.prior_bot_rate {
+        config.prior_bot_rate = prior;
+    }
+
+    let asn_db = args.asn.load()?.unwrap_or_default();
+    if !args.asn.asn_db.is_empty() {
+        println!(
+            "ASN database:   {} IPv4 + {} IPv6 ranges from {:?}",
+            asn_db.v4_range_count(),
+            asn_db.v6_range_count(),
+            args.asn.asn_db
+        );
+    }
+    println!("Router config:  {}", serde_json::to_string(&config)?);
+
+    Ok(HeuristicRouter::with_config(config, asn_db)?)
+}
+
+/// Logs per-request router/cache events to stderr only when `RUST_LOG` is set, since
+/// per-request logging would otherwise dominate the measured throughput.
+fn init_tracing_if_requested() {
+    if let Ok(filter) = std::env::var("RUST_LOG") {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(std::io::stderr)
+            .init();
+    }
 }
 
 // Only reachable via the `#[serde(default = ...)]` attribute below, which
@@ -196,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("--speed must be greater than 0.0 (got {})", args.speed);
         std::process::exit(1);
     }
+    init_tracing_if_requested();
 
     // 1. Initialize Prometheus & OpenTelemetry Registry
     let registry = prometheus::Registry::new();
@@ -245,7 +298,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Initialize Cache & Metrics Tracker
     let engine = match args.algorithm {
-        Algorithm::Dtac => Engine::Dtac(Arc::new(DtacCache::<String, bytes::Bytes>::new(args.capacity))),
+        Algorithm::Dtac => Engine::Dtac(Arc::new(
+            DtacCache::<String, bytes::Bytes>::builder(args.capacity)
+                .router(build_router(&args)?)
+                .build(),
+        )),
         Algorithm::Lru => Engine::Lru(Arc::new(BaselineLruEngine::<String, bytes::Bytes>::new(args.capacity))),
     };
     let metrics = Arc::new(BenchMetrics::default());

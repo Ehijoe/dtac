@@ -1,5 +1,7 @@
 //! Standalone binary for running the DTAC cache engine as a proxy.
 
+mod common;
+
 use axum::{
     extract::{ConnectInfo, Request, State},
     routing::{any, get},
@@ -7,7 +9,9 @@ use axum::{
     response::IntoResponse,
 };
 use clap::Parser;
+use common::AsnArgs;
 use dtac::dtac_cache::DtacCache;
+use dtac::heuristic_router::HeuristicRouter;
 use dtac::types::RequestData;
 use std::sync::Arc;
 use std::net::SocketAddr;
@@ -41,6 +45,9 @@ struct Args {
     /// Port to listen on
     #[arg(short = 'p', long, default_value_t = 8080)]
     port: u16,
+
+    #[command(flatten)]
+    asn: AsnArgs,
 }
 
 /// Handles a single proxied request.
@@ -135,7 +142,22 @@ async fn main() {
     tracing::info!("Forwarding to target: {}", args.target);
     tracing::info!("Listening on port: {}", args.port);
 
-    let cache = Arc::new(DtacCache::new(args.capacity));
+    let router = match args.asn.load() {
+        Ok(Some(asn_db)) => {
+            tracing::info!(
+                v4_ranges = asn_db.v4_range_count(),
+                v6_ranges = asn_db.v6_range_count(),
+                "Loaded ASN database"
+            );
+            HeuristicRouter::with_asn_db(asn_db)
+        }
+        Ok(None) => HeuristicRouter::new(),
+        Err(err) => {
+            tracing::error!(%err, "Failed to load ASN database");
+            std::process::exit(1);
+        }
+    };
+    let cache = Arc::new(DtacCache::builder(args.capacity).router(router).build());
     let state = AppState {
         cache,
         target: args.target.clone(),
