@@ -60,14 +60,40 @@ distinct IPs.
 resource key) to reduce lock contention. Each shard runs:
 
 - **Ghost cache**: a metadata-only (no payload) entry for resources not yet in the main cache.
-  Every miss lands here first, so a one-off scan doesn't evict genuinely popular content.
+  Every miss lands here first, so a one-off scan doesn't evict genuinely popular content. The
+  ghost is bounded at `ghost_multiplier` (default 4) times the main-cache capacity per shard. When
+  it is full, a miss first evicts a ghost entry with the same score-aware tournament as the main
+  cache. Bot-inserted entries start near score 0 and lose first, so a uniform bot scan cannot push
+  popular human items out of the ghost before their second hit (plain FIFO would let it).
 - **Promotion**: a ghost-cache entry is promoted into the real cache (fetching the payload) once
-  its EWMA popularity score crosses `PROMOTION_THRESHOLD`.
+  its EWMA popularity score crosses `promotion_threshold` (default `PROMOTION_THRESHOLD = 2.0`).
 - **Scoring**: each hit increases a resource's score by `1.0 - request_bot_prob` — human requests
   contribute close to a full point, bot-like requests contribute close to nothing. This is the
   mechanism that actually connects the router's output to caching behavior.
-- **Eviction**: a randomized tournament — sample a few entries, evict whichever has the lowest
-  *currently decayed* score. A cheap approximation of LFU/LRU that avoids a full priority queue.
+- **Eviction**: a randomized tournament — sample `n_samples` (default 5) entries, evict whichever
+  has the lowest *currently decayed* score, breaking ties by the oldest last access (so once scores
+  have decayed to 0, eviction falls back to LRU order instead of being random). A cheap
+  approximation of LFU/LRU that avoids a full priority queue.
+
+All engine constants live in `EngineConfig` (`cache_engine/config.rs`, JSON-deserializable; see
+`replay_bench --engine-config`).
+
+### Time
+
+Every time-based decision reads an injected `Clock` (`src/clock.rs`): router velocity,
+`SpaceSaver` count decay and cache score decay. `SystemClock` (the default) is the wall clock.
+`ManualClock` only moves when told to, which lets `replay_bench --clock log` run on the log's own
+timestamps and lets tests script time. `DtacCache::builder(..).clock(..)` hands one clock to both
+the router and the engine.
+
+**Time constants.** These are now parameters, not hard-coded values: `velocity_tick_ms`,
+`velocity_reset_ticks` and `space_saver_half_life_s` in `RouterConfig`, and `decay_half_life_ms`,
+`decay_cutoff_half_lives`, `promotion_threshold`, `n_samples` and `ghost_multiplier` in
+`EngineConfig`. Their defaults reproduce the original behaviour: halve a score every second, zero
+it after 32 s, one velocity shift per second. The defaults are **provisional** until plan 004's
+calibration. They were only reasonable when `--speed 10000` squeezed a replay into a few wall-clock
+seconds. On log time, cache scores decay away before most items collect enough hits to promote, and
+the velocity heuristic never fires on the benchmark's bots (about 3.6 req/s per IP).
 
 ### Binaries (`src/bin/`)
 
@@ -83,6 +109,7 @@ src/
   heuristic_router/   bot-score computation (velocity, ASN, "shy guys", header heuristics)
   cache_engine/        sharded randomized-eviction cache with ghost-cache admission
   dtac_cache.rs        combines the two + telemetry
+  clock.rs             injectable time source (system clock, or manual/log-driven)
   bin/
     dtac_standalone.rs reverse-proxy binary
     replay_bench.rs    benchmark replay tool (DTAC vs. a standard-LRU baseline)
@@ -92,7 +119,7 @@ data/asn/
 scripts/
   generate_logs.py     synthetic traffic generator
   test_generate_logs.py
-tests/                 integration tests (cache engine, heuristic router)
+tests/                 integration tests (cache engine, heuristic router, DtacCache builder)
 benchmark_logs/        generated NDJSON traffic logs (gitignored)
 ```
 
@@ -195,8 +222,10 @@ cargo run --release --bin replay_bench -- \
 ```
 
 `replay_bench` loads the NDJSON file into memory, then dispatches every record paced by its
-logged timestamp (so the router's time-based heuristics see realistic cadence, not an instant
-firehose), bounded by a concurrency-limiting semaphore. Warm-up records run through the real cache
+logged timestamp (scaled by `--speed`), bounded by a concurrency-limiting semaphore. With the
+default `--clock log`, the router and engine read time from a simulated clock that is set to each
+record's timestamp just before its access. Decay and velocity are therefore measured on the log's
+timeline, and `--speed` only changes how long the replay takes. Warm-up records run through the real cache
 exactly like any other request (so the cache actually gets populated) but are excluded from all
 reported metrics and timing; the clock resets the moment the first `"measurement"`-phase record is
 dispatched.
@@ -209,14 +238,19 @@ dispatched.
 | `-c, --capacity <N>` | `10000` | Total cache capacity (divided across 256 shards) |
 | `-j, --concurrency <N>` | `128` | Max in-flight requests at once |
 | `-s, --payload-size <BYTES>` | `1024` | Simulated payload size returned on a miss |
-| `--speed <MULTIPLIER>` | `10000.0` | Playback speed relative to logged timestamps. `1.0` = realtime (needed for the router's per-IP velocity heuristic to see a faithful cadence); higher replays faster. Defaults fast so iteration stays quick |
+| `--speed <MULTIPLIER>` | `10000.0` | Playback speed relative to logged timestamps. `1.0` = realtime; higher replays faster. With `--clock log` it only changes the run time; with `--clock wall` it also compresses the timeline that decay and velocity see |
+| `--clock <log\|wall>` | `log` | Time source for decay and velocity. `log`: a simulated clock set to each record's timestamp before its access. Because the clock never moves backwards, a request can see a time a few ms ahead of its own when a later record's task set it first (up to `--concurrency` tasks are in flight); with half-lives of seconds this is negligible. `wall`: the real clock, reproducing pre-plan-002 behaviour |
+| `--engine-config <PATH>` | *(defaults)* | JSON object of `EngineConfig` fields (`decay_half_life_ms`, `decay_cutoff_half_lives`, `promotion_threshold`, `n_samples`, `ghost_multiplier`); omitted fields keep their defaults, unknown fields are rejected |
+| `--ghost-multiplier <N>` | `4` | Ghost-cache capacity as a multiple of main-cache capacity; overrides the value from `--engine-config` |
 | `-a, --algorithm <dtac\|lru>` | `dtac` | Which cache engine to drive: DTAC's bot-aware engine, or a standard bot-unaware sharded LRU baseline (same shard count/capacity math as DTAC, for a fair comparison) |
 | `--asn-db <PATH>` | *(none)* | iptoasn `ip2asn` TSV for the datacenter-ASN heuristic. Repeatable; files are merged. E.g. `--asn-db data/asn/ip2asn-fixture.tsv` |
 | `--datacenter-asns <PATH>` | *(built-in list)* | One ASN per line, replacing the default datacenter list. Requires `--asn-db` |
-| `--router-config <PATH>` | *(defaults)* | JSON object of `RouterConfig` fields (`prior_bot_rate`, `w_asn`, `w_fav`, `w_hdr`, `burst_threshold`, `alpha`, `shy_page_threshold`); omitted fields keep their defaults, unknown fields are rejected |
+| `--router-config <PATH>` | *(defaults)* | JSON object of `RouterConfig` fields (`prior_bot_rate`, `w_asn`, `w_fav`, `w_hdr`, `burst_threshold`, `alpha`, `shy_page_threshold`, `velocity_tick_ms`, `velocity_reset_ticks`, `space_saver_half_life_s`); omitted fields keep their defaults, unknown fields are rejected |
 | `--prior-bot-rate <P>` | `0.1` | Router prior bot rate in `(0, 1)`; overrides the value from `--router-config`. `0.5` reproduces the original zero prior |
 
-The effective router configuration is printed at startup. Setting `RUST_LOG` (e.g.
+The clock mode and the effective router and engine configurations are printed at startup. A DTAC
+run's report ends with the final main- and ghost-cache entry counts (the ghost's metadata
+overhead). Setting `RUST_LOG` (e.g.
 `RUST_LOG=dtac=info`) prints per-request router decisions to stderr; leave it unset for
 throughput measurements.
 
@@ -244,6 +278,9 @@ All runs below: `--capacity 10000`, default `--speed`, on the warm-up-aware logs
 > **These results predate plans 001–004** (working ASN and "Shy Guys" heuristics, the non-zero
 > router prior, simulated time, new workloads) and will be replaced once those land. They were
 > produced with the original zero prior and with the ASN and "Shy Guys" heuristics inactive.
+> They also ran on the **wall clock** (before plan 002 added `--clock log`, now the default), so
+> decay and velocity ran on a timeline compressed by `--speed`. Rerun with `--clock wall` to
+> compare like for like. Plan 004 refreshes these tables.
 
 ### Human hit rate (primary metric) — DTAC vs. standard LRU
 
@@ -309,12 +346,6 @@ the four `traffic_mixed_*pct_bot.ndjson` files.
   otherwise.
 - **`lru = "0.12"` is a benchmark-tool-only dependency** (used solely by `replay_bench`'s baseline),
   not part of DTAC's own library or caching behavior.
-- **The ghost cache is unbounded** — entries are only removed on promotion, so every distinct
-  resource ever requested (including every one-off bot scan URL) stays in `ghost_cache` forever.
-- **Time-based logic runs on wall-clock time, not log timestamps** — the router uses `SystemTime`
-  and the cache engine uses `Instant`, so `--speed` changes the experiment itself. At the default
-  `--speed 10000`, very little wall-clock time passes during a replay, so score decay barely
-  happens and velocity is measured on a compressed timeline.
 
 ## Thesis vs. implementation
 
@@ -331,7 +362,7 @@ thesis describes something worth building.
 | 1 | DTAC is a "modified LRU" / "AI-Aware LRU" with a doubly linked list, MRU head vs. LRU tail insertion, bots "routed to the eviction tail" (Ch1 obj. 3, §3.1, §3.2.2, §3.3.2, §3.6.2, §3.7.2, §3.7.3) | No linked list, no head/tail. Ghost-cache admission + per-resource decayed score + random-sample eviction tournament (§3.4.2 describes this correctly) | Fix text |
 | 2 | Scoring runs in O(1) (Ch1 obj. 2, scope, §2.4, §2.8, Alg. 1 line 5, §3.7.3) | `SpaceSaver` uses two `BTreeSet`s → O(log K) per request with fixed K | Fix text (or implement O(1) stream-summary buckets) |
 | 3 | SpaceSaver uses "O(1) space" (§3.4.1) | O(K) space, bounded by `capacity` | Fix text |
-| 4 | Strict bounded memory everywhere (scope §1.4.2) | Ghost cache is an unbounded `HashMap` | Implement (bound the ghost cache) |
+| 4 | Strict bounded memory everywhere (scope §1.4.2) | Ghost cache bounded per shard at `ghost_multiplier` × main capacity, evicted by the score-aware tournament | Done |
 | 5 | "Shy Guys" favicon heuristic heavily penalizes sessions (§3.2.2, §3.4.1, Alg. 1 heuristic C) | Flags an IP after `shy_page_threshold` (default 5) page requests with no auxiliary-asset fetch ever | Done |
 | 6 | Cross-references datacenter ASN databases (§3.4.1, Alg. 1 heuristic B) | Offline iptoasn `ip2asn` lookup + curated datacenter-ASN list (`--asn-db`); benchmark uses a fixture that matches the generator's bot IPs by construction | Done |
 | 7 | Penalties for "missing or misordered headers", `Sec-CH-UA`, User-Agent (§3.4.1, §3.5.2) | Only checks presence of `Accept-Language` | Fix text (or implement more header checks) |
@@ -341,7 +372,7 @@ thesis describes something worth building.
 | 11 | Derives `N = 14` as the default sample size (§3.4.3) | `N_SAMPLES = 5` | Pick one; make text and code agree |
 | 12 | Eviction overhead "drops to zero" (§3.4.2) | O(N) per eviction | Fix text |
 | 13 | Score appended as `X-Bot-Probability` header and forwarded to a separate cache (§3.2.3, §3.4.1) | Single process; `DtacCache::access` passes the score directly in memory | Fix text |
-| 14 | Alg. 2: `fetch_from_origin` inside the shard lock; `score >> delta_t` on a float | Fetch happens outside the lock, with a re-check for concurrent promotion; decay is `score / 2^dt`, zeroed after 32 s | Fix text (the real design is better — describe it) |
+| 14 | Alg. 2: `fetch_from_origin` inside the shard lock; `score >> delta_t` on a float | Fetch happens outside the lock, with a re-check for concurrent promotion; decay is stepwise, `score / 2^⌊Δt / decay_half_life_ms⌋`, zeroed after `decay_cutoff_half_lives` half-lives (defaults 1 s and 32, provisional) | Fix text (the real design is better — describe it) |
 | 15 | Data generator and replayer are "custom Rust scripts" (§3.3.3, §3.5) | Generator is Python (`scripts/generate_logs.py`); replayer is Rust | Fix text |
 | 16 | Bots sample uniformly from a "separate subset" of the catalog (§3.5.2) | Bots sample uniformly from the **entire** catalog, overlapping with human items | Fix text |
 | 17 | Bots identified via omitted favicon, missing headers, mechanical timing (§3.5.2) | True of the generator, but the router only sees velocity + `Accept-Language` (see #5, #7); bots use a fixed 14-IP pool | Fix text; state the 14-IP assumption |
@@ -387,8 +418,8 @@ thesis describes something worth building.
 
 - [ ] Ablation run: DTAC with `bot_prob` forced to `0` — separates the effect of the AI score from the effect of ghost-cache admission alone
 - [ ] Scan-resistant baselines: SIEVE and/or S3FIFO (Ch. 2 cites them as already strong under scans; beating only LRU is a weak claim)
-- [ ] Bound the ghost cache (e.g. per-shard cap with FIFO eviction, as in S3FIFO's ghost queue)
-- [ ] Drive time-based logic from log timestamps (or report results at `--speed 1.0`) so decay and velocity behave as designed
+- [x] Bound the ghost cache (per-shard cap, evicted by the score-aware tournament rather than FIFO so bot scans can't flush it)
+- [x] Drive time-based logic from log timestamps (`replay_bench --clock log`, an injected `Clock`), with every time constant configurable
 - [ ] Repeated runs with different seeds, reporting mean ± spread
 - [ ] Split latency: `T_proxy` (router) and `T_cache` (engine) reported separately, with p50/p99, not just the average
 - [ ] Memory measurement (peak RSS or structure sizes) for DTAC vs. LRU
@@ -413,7 +444,7 @@ Other goals and claims from the scope and methodology:
 | Goal / claim | Status |
 |---|---|
 | Bounded memory for client state (SpaceSaver) | Achieved |
-| Bounded memory for the whole system | Not achieved — ghost cache is unbounded. Achievable. |
+| Bounded memory for the whole system | Achieved — the ghost cache is now bounded per shard (`ghost_multiplier` × main capacity) |
 | Lock-sharded, concurrent cache | Achieved |
 | Measure memory consumption and read-path CPU overhead | Not done. Achievable. |
 | `T_proxy` below 2 ms | Not separately measured. Likely achievable: average combined access time is reported in µs. |
