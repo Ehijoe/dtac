@@ -12,6 +12,7 @@ pub mod dtac_cache;
 pub mod error;
 /// Contains the heuristic routing logic and router implementation.
 pub mod heuristic_router;
+mod sync;
 /// Defines the common data structures and types used across the library.
 pub mod types;
 

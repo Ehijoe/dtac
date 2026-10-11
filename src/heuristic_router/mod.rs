@@ -134,7 +134,7 @@ impl HeuristicRouter {
         let now_ms = self.clock.now_millis();
 
         // --- PHASE 1: State Retrieval & Bounded Memory Management ---
-        let mut ip_state = self.space_saver.get_or_add_and_evict(client_ip).await;
+        let mut ip_state = self.space_saver.get_or_add_and_evict(client_ip);
 
         // --- PHASE 2: EWMA Velocity Calculation (Bitwise) ---
         // Count tick boundaries crossed rather than whole ticks elapsed, so that a
@@ -162,7 +162,7 @@ impl HeuristicRouter {
             is_auxiliary_asset(&req.path),
             self.config.shy_page_threshold,
         );
-        self.space_saver.update(client_ip, ip_state.clone()).await;
+        self.space_saver.update(client_ip, ip_state);
 
         // --- PHASE 3: Log-Odds Heuristic Evaluation ---
         let mut score = self.l_0;
