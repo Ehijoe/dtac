@@ -5,6 +5,7 @@
 
 pub mod space_saver;
 pub mod asn_db;
+pub mod config;
 /// Module defining the structure and logic for AI scores.
 pub mod score;
 
@@ -13,19 +14,11 @@ use crate::error::Result;
 use score::AiScore;
 use space_saver::SpaceSaver;
 use asn_db::AsnDatabase;
+use config::RouterConfig;
 use tracing::{debug, instrument, info};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram};
-
-const BURST_THRESHOLD: f64 = 10.0;
-const ALPHA: f64 = 2.0;
-
-/// Page requests an IP may make without ever fetching an auxiliary asset before the
-/// "Shy Guys" heuristic fires. This is a grace period: a short human visit that never
-/// pulls the favicon (for example because the browser already cached it) must not be
-/// penalized.
-const SHY_PAGE_THRESHOLD: u16 = 5;
 
 /// File extensions treated as auxiliary (non-page) assets by the "Shy Guys" heuristic.
 const AUXILIARY_ASSET_EXTENSIONS: &[&str] = &[
@@ -38,14 +31,10 @@ const AUXILIARY_ASSET_EXTENSIONS: &[&str] = &[
 /// the final score for a given request.
 #[derive(Debug)]
 pub struct HeuristicRouter {
-    /// Baseline Prior Log-Odds (L_0)
+    /// Weights and thresholds of the log-odds model.
+    config: RouterConfig,
+    /// Baseline prior log-odds (`l_0`), derived once from `config.prior_bot_rate`.
     l_0: f64,
-    /// Datacenter ASN log-likelihood weight (W_asn)
-    w_asn: f64,
-    /// "Shy Guys" (missing assets) log-likelihood weight (W_fav)
-    w_fav: f64,
-    /// Anomalous header log-likelihood weight (W_hdr)
-    w_hdr: f64,
     /// IP → ASN lookup used by the datacenter heuristic.
     asn_db: AsnDatabase,
     /// Bounded-memory tracker for IP state.
@@ -57,26 +46,39 @@ pub struct HeuristicRouter {
 }
 
 impl HeuristicRouter {
-    /// Creates a new `HeuristicRouter` with default weights and an empty ASN database
-    /// (so the datacenter heuristic never fires).
+    /// Creates a new `HeuristicRouter` with the default [`RouterConfig`] and an empty
+    /// ASN database (so the datacenter heuristic never fires).
     pub fn new() -> Self {
-        Self::build(AsnDatabase::empty())
+        Self::build(RouterConfig::default(), AsnDatabase::empty())
     }
 
-    /// Creates a router with default weights that flags datacenter IPs using `asn_db`.
+    /// Creates a router with the default [`RouterConfig`] that flags datacenter IPs
+    /// using `asn_db`.
     pub fn with_asn_db(asn_db: AsnDatabase) -> Self {
-        Self::build(asn_db)
+        Self::build(RouterConfig::default(), asn_db)
     }
 
-    /// Shared constructor.
-    fn build(asn_db: AsnDatabase) -> Self {
+    /// Creates a router with a custom [`RouterConfig`] and ASN database.
+    ///
+    /// Fails with [`DTACError::ConfigError`](crate::error::DTACError::ConfigError) if
+    /// `config` does not pass [`RouterConfig::validate`].
+    pub fn with_config(config: RouterConfig, asn_db: AsnDatabase) -> Result<Self> {
+        config.validate()?;
+        Ok(Self::build(config, asn_db))
+    }
+
+    /// The configuration this router scores requests with.
+    pub const fn config(&self) -> &RouterConfig {
+        &self.config
+    }
+
+    /// Shared constructor; `config` must already be valid.
+    fn build(config: RouterConfig, asn_db: AsnDatabase) -> Self {
         let meter = global::meter("dtac");
 
         Self {
-            l_0: 0.0,
-            w_asn: 1.5,
-            w_fav: 1.2,
-            w_hdr: 1.0,
+            l_0: config.prior_log_odds(),
+            config,
             asn_db,
             space_saver: SpaceSaver::new(10000, 3600), // Default capacity 10000 IPs, 1 hour TTL
             eval_requests_counter: meter.u64_counter("dtac.router.evaluations").with_description("Number of requests evaluated by heuristic router").init(),
@@ -123,7 +125,7 @@ impl HeuristicRouter {
         // Commit updated state back to memory
         ip_state.last_seen = current_time;
         ip_state.velocity = new_velocity;
-        ip_state.record_request(is_auxiliary_asset(&req.path), SHY_PAGE_THRESHOLD);
+        ip_state.record_request(is_auxiliary_asset(&req.path), self.config.shy_page_threshold);
         self.space_saver.update(client_ip, ip_state.clone()).await;
 
         // --- PHASE 3: Log-Odds Heuristic Evaluation ---
@@ -131,20 +133,20 @@ impl HeuristicRouter {
 
         // Heuristic A: Continuous Graded Velocity Penalty
         let float_v = new_velocity as f64 / 1024.0;
-        if float_v > BURST_THRESHOLD {
-            score += ALPHA * (float_v / BURST_THRESHOLD).ln();
+        if float_v > self.config.burst_threshold {
+            score += self.config.alpha * (float_v / self.config.burst_threshold).ln();
         }
 
         // Heuristic B: Infrastructure Origin (Datacenter ASN)
         let is_datacenter = self.asn_db.is_datacenter(&client_ip);
         if is_datacenter {
-            score += self.w_asn;
+            score += self.config.w_asn;
         }
 
         // Heuristic C: "Shy Guys" Passive Behavioral Check
         let missing_assets = ip_state.missing_auxiliary_assets;
         if missing_assets {
-            score += self.w_fav;
+            score += self.config.w_fav;
         }
 
         // Heuristic D: Anomalous/Missing Headers
@@ -152,7 +154,7 @@ impl HeuristicRouter {
         // Assuming req.headers keys might need to match "accept-language" here.
         let has_accept_lang = req.headers.keys().any(|k| k.eq_ignore_ascii_case("accept-language"));
         if !has_accept_lang {
-            score += self.w_hdr;
+            score += self.config.w_hdr;
         }
 
         // --- PHASE 4: Sigmoid Conversion & Forwarding ---

@@ -39,6 +39,7 @@ mod asn_and_shy_guys {
 
     use dtac::heuristic_router::HeuristicRouter;
     use dtac::heuristic_router::asn_db::AsnDatabase;
+    use dtac::heuristic_router::config::RouterConfig;
     use dtac::types::RequestData;
     use std::collections::HashMap;
     use std::net::IpAddr;
@@ -80,6 +81,10 @@ mod asn_and_shy_guys {
             last = score(router, &human_request(ip_address, path)).await;
         }
         last
+    }
+
+    fn sigmoid(x: f64) -> f64 {
+        1.0 / (1.0 + (-x).exp())
     }
 
     #[test]
@@ -154,5 +159,33 @@ mod asn_and_shy_guys {
 
         assert!(b > a, "shy IP {b} should exceed favicon IP {a}");
         assert!((under_threshold - a).abs() < 1e-12, "4 pages must not be flagged");
+    }
+
+    #[tokio::test]
+    async fn clean_human_scores_at_the_prior() {
+        let router = HeuristicRouter::new();
+        let got = score(&router, &human_request(ISP_IP, "/item/1")).await;
+        assert!((got - sigmoid((1.0_f64 / 9.0).ln())).abs() < 1e-6);
+        assert!((got - 0.1).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn even_prior_reproduces_original_scores() {
+        let config = RouterConfig { prior_bot_rate: 0.5, ..Default::default() };
+        let router = HeuristicRouter::with_config(config, AsnDatabase::empty()).unwrap();
+
+        let clean = score(&router, &human_request(ISP_IP, "/item/1")).await;
+        assert!((clean - 0.5).abs() < 1e-12);
+
+        let mut no_header = human_request("24.9.9.9", "/item/1");
+        no_header.headers.clear();
+        let header_only = score(&router, &no_header).await;
+        assert!((header_only - sigmoid(1.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn invalid_config_is_rejected() {
+        let config = RouterConfig { prior_bot_rate: 1.5, ..Default::default() };
+        assert!(HeuristicRouter::with_config(config, AsnDatabase::empty()).is_err());
     }
 }
