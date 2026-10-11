@@ -17,4 +17,4 @@ pub use types::RequestData;
 pub use heuristic_router::HeuristicRouter;
 pub use heuristic_router::asn_db::AsnDatabase;
 pub use heuristic_router::config::RouterConfig;
-pub use dtac_cache::DtacCache;
+pub use dtac_cache::{DtacCache, DtacCacheBuilder};
