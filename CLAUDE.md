@@ -104,18 +104,28 @@ recorded.
 
 `HeuristicRouter::evaluate_request` implements a **log-odds (logistic regression-style) scoring
 pipeline**: start from a baseline prior `l_0`, add weighted contributions from independent heuristics,
-then squash through a sigmoid to get a `[0,1]` bot probability (`AiScore`, in `score.rs`):
+then squash through a sigmoid to get a `[0,1]` bot probability (`AiScore`, in `score.rs`). All
+weights/thresholds live in `RouterConfig` (`config.rs`, serde-deserializable, validated by
+`HeuristicRouter::with_config`); `l_0` is derived from `prior_bot_rate` (default 0.1, so
+`l_0 = ln(0.1/0.9) ≈ −2.20`, and a clean human request scores ≈ 0.1):
 
 - **Velocity heuristic**: per-IP request rate tracked as an EWMA using *bitwise right-shift* for
   exponential decay (not floating-point multiply) — `velocity >> delta_t`, fixed-point scaled by
-  1024. A graded penalty (`ALPHA * ln(velocity/BURST_THRESHOLD)`) applies once velocity exceeds
-  `BURST_THRESHOLD`.
-- **ASN heuristic** (`asn_db.rs`): flags datacenter/hosting-provider IPs. Currently a stub
-  (`AsnDatabase::is_datacenter` always returns `false`) — real ASN lookup is not implemented.
-- **"Shy guys" heuristic**: penalizes IPs that never fetch auxiliary assets (favicon, etc.) the way
-  real browsers do — tracked via `IpState.missing_auxiliary_assets`, but nothing in this router
-  currently *sets* that flag to `true`; it's plumbed through from `SpaceSaver` state for a caller to
-  populate.
+  1024. A graded penalty (`alpha * ln(velocity/burst_threshold)`) applies once velocity exceeds
+  `burst_threshold`.
+- **ASN heuristic** (`asn_db.rs`): `AsnDatabase` holds sorted v4 (`u32`) and v6 (`u128`) ranges
+  parsed from iptoasn.com `ip2asn` TSV files and finds an IP's ASN via `partition_point` binary
+  search, then checks it against a datacenter-ASN set (`DEFAULT_DATACENTER_ASNS`, overridable with
+  `with_datacenter_asns`). `HeuristicRouter::new()` uses an empty DB (heuristic never fires);
+  `with_asn_db`/`with_config` take a loaded one. Both binaries accept repeatable `--asn-db` and
+  `--datacenter-asns` via the shared `src/bin/common/mod.rs`. `data/asn/ip2asn-fixture.tsv` is a
+  committed fixture matching the generator's datacenter bot IPs (by construction — not evidence
+  of real-world accuracy); full downloads in `data/asn/` are gitignored.
+- **"Shy guys" heuristic**: penalizes IPs that have made `shy_page_threshold` (default 5) page
+  requests and *never* fetched an auxiliary asset (`is_auxiliary_asset` in `mod.rs`: favicon,
+  apple-touch-icon, or a static-asset extension). `IpState::record_request` updates
+  `page_requests`/`has_fetched_asset` and derives `missing_auxiliary_assets` inside the router's
+  read → mutate → `update` block.
 - **Header heuristic**: penalizes requests missing an `Accept-Language` header.
 
 Per-IP state (`IpState`: last-seen time, EWMA velocity, asset-miss flag, request count) is tracked in
@@ -156,6 +166,9 @@ shard independently runs the same algorithm:
 promotion — hits and ghost-hits return without touching the closure. The lock is held only for the
 cache-state transition decision; the async `fetch_from_origin` call happens *outside* the lock
 (`Action` enum marks what to do after releasing it), so origin fetches never block other shard access.
+
+`DtacCache::builder(capacity).router(router).build()` is how a custom router is injected;
+`DtacCache::new(capacity)` is shorthand for the defaults.
 
 ### Binaries (`src/bin/`)
 
