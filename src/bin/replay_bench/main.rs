@@ -1,30 +1,29 @@
 //! Replay script that doesn't make network requests for benchmarking
 
+#[path = "../common/mod.rs"]
 mod common;
+mod engines;
+mod metrics;
 
 use clap::Parser;
 use common::AsnArgs;
-use dtac::cache_engine::NUM_SHARDS;
 use dtac::cache_engine::config::EngineConfig;
 use dtac::clock::ManualClock;
 use dtac::dtac_cache::DtacCache;
 use dtac::heuristic_router::HeuristicRouter;
 use dtac::heuristic_router::config::RouterConfig;
 use dtac::types::RequestData;
+use engines::{BaselineLruEngine, Engine};
 use indicatif::{ProgressBar, ProgressStyle};
-use lru::LruCache;
-use prometheus::{Encoder, TextEncoder};
+use metrics::{BenchMetrics, init_metrics, print_results};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
-use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant as TokioInstant, sleep_until};
@@ -228,98 +227,6 @@ fn resolve_ip(raw: &str) -> IpAddr {
 /// `speed` (1.0 = realtime, higher = faster).
 fn target_instant(bench_start: TokioInstant, timestamp: f64, speed: f64) -> TokioInstant {
     bench_start + Duration::from_secs_f64(timestamp / speed)
-}
-
-#[derive(Default)]
-struct BenchMetrics {
-    // Total counters
-    total_requests: AtomicU64,
-    cache_miss_fetches: AtomicU64, // Increment when fetch_from_origin is called
-
-    // Disaggregated human vs bot counters
-    human_requests: AtomicU64,
-    human_misses: AtomicU64,
-    bot_requests: AtomicU64,
-    bot_misses: AtomicU64,
-
-    // Timing
-    total_duration_us: AtomicU64,
-}
-
-/// A standard, bot-unaware sharded LRU cache: the baseline that
-/// `--algorithm lru` benchmarks against DTAC's own engine. Shards the same
-/// way as `DtacCacheEngine` (same `NUM_SHARDS`, same capacity-per-shard
-/// math) so the comparison isolates eviction/admission policy rather than
-/// lock granularity or capacity partitioning. Bench-tool-only -- not part
-/// of the published `dtac` library.
-struct BaselineLruEngine<K, P> {
-    shards: Vec<Mutex<LruCache<K, P>>>,
-}
-
-impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
-    fn new(total_capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(total_capacity / NUM_SHARDS).unwrap_or(NonZeroUsize::MIN);
-        let shards = (0..NUM_SHARDS)
-            .map(|_| Mutex::new(LruCache::new(cap)))
-            .collect();
-        Self { shards }
-    }
-
-    // Only the hash's low bits matter for picking one of NUM_SHARDS shards.
-    #[allow(clippy::cast_possible_truncation)]
-    fn get_shard_id(key: &K) -> usize {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        (hasher.finish() as usize) % NUM_SHARDS
-    }
-
-    /// Locks one shard, recovering the guard if a previous holder panicked, the same
-    /// way `DtacCacheEngine` does.
-    fn shard(&self, shard_id: usize) -> MutexGuard<'_, LruCache<K, P>> {
-        self.shards[shard_id]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    async fn access<F, Fut>(&self, key: K, fetch_from_origin: F) -> P
-    where
-        F: FnOnce(&K) -> Fut,
-        Fut: Future<Output = P>,
-    {
-        let shard_id = Self::get_shard_id(&key);
-
-        // lru's get() already promotes to MRU
-        let hit = self.shard(shard_id).get(&key).cloned();
-        if let Some(payload) = hit {
-            return payload;
-        }
-
-        // Release the lock before awaiting, matching DtacCacheEngine's
-        // convention of never holding a shard lock across an await point.
-        let payload = fetch_from_origin(&key).await;
-        // idempotent per key: no orphan-entry risk
-        self.shard(shard_id).put(key, payload.clone());
-        payload
-    }
-}
-
-#[derive(Clone)]
-enum Engine {
-    Dtac(Arc<DtacCache<String, bytes::Bytes>>),
-    Lru(Arc<BaselineLruEngine<String, bytes::Bytes>>),
-}
-
-/// Routes the library's OpenTelemetry metrics into a fresh Prometheus registry.
-fn init_metrics() -> Result<prometheus::Registry, Box<dyn std::error::Error>> {
-    let registry = prometheus::Registry::new();
-    let exporter = opentelemetry_prometheus::exporter()
-        .with_registry(registry.clone())
-        .build()?;
-    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-        .with_reader(exporter)
-        .build();
-    opentelemetry::global::set_meter_provider(meter_provider);
-    Ok(registry)
 }
 
 /// Reads every non-blank line of the NDJSON log at `path` into memory.
@@ -560,94 +467,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Request counts and microsecond totals are far below 2^52, so f64 is exact here.
-#[allow(clippy::cast_precision_loss)]
-fn print_results(
-    m: &BenchMetrics,
-    total_time: Duration,
-    registry: &prometheus::Registry,
-    algorithm: Algorithm,
-) {
-    let total_reqs = m.total_requests.load(Ordering::Relaxed);
-    let total_misses = m.cache_miss_fetches.load(Ordering::Relaxed);
-    let total_hits = total_reqs.saturating_sub(total_misses);
-
-    let human_reqs = m.human_requests.load(Ordering::Relaxed);
-    let human_misses = m.human_misses.load(Ordering::Relaxed);
-    let human_hits = human_reqs.saturating_sub(human_misses);
-
-    let bot_reqs = m.bot_requests.load(Ordering::Relaxed);
-    let bot_misses = m.bot_misses.load(Ordering::Relaxed);
-    let bot_hits = bot_reqs.saturating_sub(bot_misses);
-
-    let total_us = m.total_duration_us.load(Ordering::Relaxed);
-    let avg_latency_us = if total_reqs > 0 {
-        total_us as f64 / total_reqs as f64
-    } else {
-        0.0
-    };
-    let rps = total_reqs as f64 / total_time.as_secs_f64();
-
-    let overall_hit_rate = if total_reqs > 0 {
-        (total_hits as f64 / total_reqs as f64) * 100.0
-    } else {
-        0.0
-    };
-    let human_hit_rate = if human_reqs > 0 {
-        (human_hits as f64 / human_reqs as f64) * 100.0
-    } else {
-        0.0
-    };
-    let bot_hit_rate = if bot_reqs > 0 {
-        (bot_hits as f64 / bot_reqs as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let report_label = match algorithm {
-        Algorithm::Dtac => "DTAC",
-        Algorithm::Lru => "STANDARD LRU (BASELINE)",
-    };
-    println!("\n========================================================");
-    println!("          {report_label} DIRECT BENCHMARK REPORT          ");
-    println!("          (post-warm-up, steady-state measurement)        ");
-    println!("========================================================");
-    println!("Elapsed Time:           {total_time:.3?}");
-    println!("Throughput:             {rps:.2} ops/sec");
-    println!("Average Access Time:    {avg_latency_us:.3} µs");
-    println!("--------------------------------------------------------");
-    println!("PRIMARY METRIC");
-    println!("Human Requests:         {human_reqs}");
-    println!(
-        "Human Cache Hit Rate:   {human_hit_rate:.2}% ({human_hits} hits / {human_misses} misses)"
-    );
-    println!("--------------------------------------------------------");
-    println!("SECONDARY METRIC");
-    println!("Total Requests:         {total_reqs}");
-    println!("Overall Cache Hit Rate: {total_hits} ({overall_hit_rate:.2}%)");
-    println!(
-        "Total Cache Misses:     {} ({:.2}%)",
-        total_misses,
-        100.0 - overall_hit_rate
-    );
-    println!("--------------------------------------------------------");
-    println!("FOR REFERENCE ONLY -- not an optimization target");
-    println!("Bot Requests:           {bot_reqs}");
-    println!("Bot Cache Hit Rate:     {bot_hit_rate:.2}% ({bot_hits} hits / {bot_misses} misses)");
-    println!("========================================================");
-
-    // Print internal Prometheus metrics gathered by DTAC / OpenTelemetry
-    println!("\n--- Raw Prometheus Metrics Registry Output ---");
-    let encoder = TextEncoder::new();
-    let mut buffer = vec![];
-    let metric_families = registry.gather();
-    if encoder.encode(&metric_families, &mut buffer).is_ok()
-        && let Ok(text) = String::from_utf8(buffer)
-    {
-        println!("{text}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,81 +536,5 @@ mod tests {
         while tasks.join_next().await.is_some() {}
 
         assert_eq!(dtac::clock::Clock::now_millis(&*clock), 999 * 125);
-    }
-
-    #[tokio::test]
-    async fn baseline_lru_hit_after_miss_does_not_refetch() {
-        let engine = BaselineLruEngine::<String, i32>::new(1);
-        let fetches = AtomicU64::new(0);
-
-        let miss = engine
-            .access("only-key".to_string(), |_k| {
-                fetches.fetch_add(1, Ordering::Relaxed);
-                async { 42 }
-            })
-            .await;
-        assert_eq!(miss, 42);
-        assert_eq!(fetches.load(Ordering::Relaxed), 1);
-
-        let hit = engine
-            .access("only-key".to_string(), |_k| {
-                fetches.fetch_add(1, Ordering::Relaxed);
-                async { -1 } // would prove this ran if it did
-            })
-            .await;
-        assert_eq!(hit, 42);
-        assert_eq!(fetches.load(Ordering::Relaxed), 1); // fetch not called again
-    }
-
-    #[tokio::test]
-    async fn baseline_lru_evicts_least_recently_used_within_a_shard() {
-        // DefaultHasher is fixed-seed, so shard assignment is deterministic;
-        // brute-force three candidate keys that collide into the same shard
-        // so recency-ordered (not just capacity-1-swap) eviction is
-        // observable, without depending on shard-count internals beyond
-        // what BaselineLruEngine already exposes.
-        let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
-        for i in 0..5000 {
-            let key = format!("k{i}");
-            let shard = BaselineLruEngine::<String, i32>::get_shard_id(&key);
-            by_shard.entry(shard).or_default().push(key);
-        }
-        let (key_a, key_b, key_c) = by_shard
-            .values()
-            .find(|keys| keys.len() >= 3)
-            .map(|keys| (keys[0].clone(), keys[1].clone(), keys[2].clone()))
-            .expect("5000 candidate keys across 256 shards must collide 3-deep somewhere");
-
-        // total_capacity = 2 * NUM_SHARDS -> capacity_per_shard == 2.
-        let engine = BaselineLruEngine::<String, i32>::new(2 * NUM_SHARDS);
-
-        let _ = engine.access(key_a.clone(), |_k| async { 1 }).await; // shard (MRU->LRU): [A]
-        let _ = engine.access(key_b.clone(), |_k| async { 2 }).await; // shard: [B, A]
-        let _ = engine.access(key_a.clone(), |_k| async { 1 }).await; // hit: promotes A -> shard: [A, B]
-        let _ = engine.access(key_c.clone(), |_k| async { 3 }).await; // miss, over capacity: evicts LRU (B) -> shard: [C, A]
-
-        // Check key_a's survival BEFORE checking key_b: verifying a miss is
-        // itself a cache-mutating access (it re-inserts the key), so
-        // checking key_b first would evict key_a all over again and
-        // invalidate this assertion order.
-        let refetch_a = AtomicU64::new(0);
-        let a_again = engine
-            .access(key_a.clone(), |_k| {
-                refetch_a.fetch_add(1, Ordering::Relaxed);
-                async { 99 }
-            })
-            .await;
-        assert_eq!(a_again, 1); // original value, not 99 -- key_a survived as a hit
-        assert_eq!(refetch_a.load(Ordering::Relaxed), 0);
-
-        let refetch_b = AtomicU64::new(0);
-        let b_again = engine
-            .access(key_b.clone(), |_k| {
-                refetch_b.fetch_add(1, Ordering::Relaxed);
-                async { -1 }
-            })
-            .await;
-        assert_eq!(b_again, -1);
-        assert_eq!(refetch_b.load(Ordering::Relaxed), 1); // confirms key_b was evicted
     }
 }
