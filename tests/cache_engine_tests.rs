@@ -225,3 +225,63 @@ async fn ghost_cache_stays_bounded_under_a_unique_key_scan() {
     let (total_entries, total_mapped) = engine.debug_integrity_counts();
     assert_eq!(total_entries, total_mapped);
 }
+
+#[tokio::test]
+async fn eviction_listener_fires_once_per_main_cache_eviction_outside_the_lock() {
+    use dtac::cache_engine::NUM_SHARDS;
+    use dtac::cache_engine::config::EngineConfig;
+    use dtac::clock::ManualClock;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    // One main slot per shard, so most promotions evict something.
+    let engine_slot: Arc<OnceLock<Arc<DtacCacheEngine<String, ()>>>> = Arc::new(OnceLock::new());
+    let evicted: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+    let listener = {
+        let engine_slot = engine_slot.clone();
+        let evicted = evicted.clone();
+        Arc::new(move |key: &String| {
+            // Locks every shard: this would deadlock if the listener ran under a shard lock.
+            let _ = engine_slot.get().unwrap().debug_integrity_counts();
+            *evicted.lock().unwrap().entry(key.clone()).or_default() += 1;
+        })
+    };
+    let engine = Arc::new(
+        DtacCacheEngine::<String, ()>::with_config(
+            NUM_SHARDS,
+            EngineConfig::default(),
+            Arc::new(ManualClock::new(0)),
+        )
+        .unwrap()
+        .with_eviction_listener(listener),
+    );
+    engine_slot.set(engine.clone()).unwrap();
+
+    // Two human requests promote a key (score 1 + 1 reaches the threshold of 2).
+    let keys: Vec<String> = (0..2_000).map(|i| format!("k{i}")).collect();
+    for key in &keys {
+        engine.access(key.clone(), 0.0, |_k| async {}).await;
+        engine.access(key.clone(), 0.0, |_k| async {}).await;
+    }
+
+    let evicted = evicted.lock().unwrap().clone();
+    let resident = engine.len();
+    assert_eq!(evicted.values().sum::<usize>(), keys.len() - resident);
+    assert!(
+        evicted.values().all(|&n| n == 1),
+        "a key was reported twice"
+    );
+    assert!(!evicted.is_empty());
+}
+
+#[tokio::test]
+async fn resident_keys_matches_the_integrity_count() {
+    let engine = DtacCacheEngine::<String, ()>::new(1024);
+    for i in 0..5_000 {
+        let key = format!("k{}", i % 1_500);
+        engine.access(key, 0.0, |_k| async {}).await;
+    }
+    let resident = engine.resident_keys();
+    assert_ne!(resident.len(), 0);
+    assert_eq!(resident.len(), engine.debug_integrity_counts().0);
+}

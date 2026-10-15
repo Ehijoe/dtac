@@ -12,6 +12,7 @@ use config::EngineConfig;
 use rand::Rng;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +30,19 @@ pub const PROMOTION_THRESHOLD: f32 = 2.0;
 /// Default ghost-cache capacity per shard, as a multiple of the main-cache capacity per
 /// shard ([`EngineConfig::ghost_multiplier`]).
 pub const GHOST_CAPACITY_MULTIPLIER: usize = 4;
+
+/// A callback told about every key evicted from the main cache, e.g. to log evictions by
+/// origin. See [`DtacCacheEngine::with_eviction_listener`].
+pub type EvictionListener<K> = Arc<dyn Fn(&K) + Send + Sync>;
+
+/// Wraps an [`EvictionListener`] so the engine can still derive `Debug`.
+struct Listener<K>(EvictionListener<K>);
+
+impl<K> fmt::Debug for Listener<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EvictionListener")
+    }
+}
 
 /// Metadata for a cached resource, tracking access time and EWMA score.
 #[derive(Clone, Copy, Debug)]
@@ -194,12 +208,10 @@ impl<K: Eq + Hash + Clone, P: Clone> CacheShard<K, P> {
         }
     }
 
-    /// Evicts one main-cache entry chosen by [`tournament_victim`].
-    fn execute_eviction_tournament(&mut self, now_ms: u64, config: &EngineConfig) {
-        if let Some(idx) = tournament_victim(&self.entries, now_ms, config, &mut rand::thread_rng())
-        {
-            swap_remove_indexed(&mut self.main_cache_map, &mut self.entries, idx);
-        }
+    /// Evicts one main-cache entry chosen by [`tournament_victim`] and returns its key.
+    fn execute_eviction_tournament(&mut self, now_ms: u64, config: &EngineConfig) -> Option<K> {
+        let idx = tournament_victim(&self.entries, now_ms, config, &mut rand::thread_rng())?;
+        Some(swap_remove_indexed(&mut self.main_cache_map, &mut self.entries, idx).0)
     }
 }
 
@@ -213,6 +225,7 @@ pub struct DtacCacheEngine<K, P> {
     ghost_capacity_per_shard: usize,
     config: EngineConfig,
     clock: Arc<dyn Clock>,
+    eviction_listener: Option<Listener<K>>,
 }
 
 impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
@@ -261,7 +274,18 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
             ghost_capacity_per_shard,
             config,
             clock,
+            eviction_listener: None,
         }
+    }
+
+    /// Calls `listener` with the key of every entry evicted from the main cache.
+    ///
+    /// The listener runs after the shard lock is released, so it may call back into the
+    /// engine. Ghost-cache evictions are not reported.
+    #[must_use]
+    pub fn with_eviction_listener(mut self, listener: EvictionListener<K>) -> Self {
+        self.eviction_listener = Some(Listener(listener));
+        self
     }
 
     /// The configuration this engine runs with.
@@ -326,6 +350,24 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
             let shard = lock(shard);
             (e + shard.entries.len(), m + shard.main_cache_map.len())
         })
+    }
+
+    /// The keys currently in the main cache, across all shards.
+    ///
+    /// Intended for diagnostics only, like
+    /// [`debug_integrity_counts`](Self::debug_integrity_counts): it locks every shard in
+    /// turn, so the result is not a single consistent snapshot under concurrent access.
+    pub fn resident_keys(&self) -> Vec<K> {
+        self.shards
+            .iter()
+            .flat_map(|shard| {
+                lock(shard)
+                    .entries
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Returns `(ghost_entries, ghost_mapped_keys)` for each shard.
@@ -438,44 +480,53 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
             Action::Hit(payload) => payload,
             Action::Promote(meta) => {
                 let payload = fetch_from_origin(&requested_resource).await;
-                let mut shard = lock(&self.shards[shard_id]);
+                let evicted = {
+                    let mut shard = lock(&self.shards[shard_id]);
 
-                // Another concurrent task may have already promoted this same key
-                // while our fetch_from_origin above was in flight (the shard lock is
-                // dropped for the duration of that await, and the ghost-cache entry
-                // is updated in place rather than removed until a promotion commits,
-                // so every concurrent racer's Phase 1/2 check can independently reach
-                // Action::Promote for the same key). If so, adopt the winner's entry
-                // rather than pushing a second one: a second push+insert would
-                // overwrite main_cache_map's index for this key while leaving the
-                // first-pushed `entries` slot unreachable -- a permanent, leaked
-                // capacity slot that only random eviction sampling could ever clear.
-                // We deliberately discard our own duplicate fetch/meta here rather
-                // than merging them in; the winning entry's score/last_accessed will
-                // be refreshed by the very next ordinary Hit on this (by definition
-                // hot) key, and the extra fetch_from_origin call is accepted as
-                // bounded, non-corrupting wasted work rather than a correctness bug.
-                if let Some(&idx) = shard.main_cache_map.get(&requested_resource) {
-                    return shard.entries[idx].1.payload.clone();
+                    // Another concurrent task may have already promoted this same key
+                    // while our fetch_from_origin above was in flight (the shard lock is
+                    // dropped for the duration of that await, and the ghost-cache entry
+                    // is updated in place rather than removed until a promotion commits,
+                    // so every concurrent racer's Phase 1/2 check can independently reach
+                    // Action::Promote for the same key). If so, adopt the winner's entry
+                    // rather than pushing a second one: a second push+insert would
+                    // overwrite main_cache_map's index for this key while leaving the
+                    // first-pushed `entries` slot unreachable -- a permanent, leaked
+                    // capacity slot that only random eviction sampling could ever clear.
+                    // We deliberately discard our own duplicate fetch/meta here rather
+                    // than merging them in; the winning entry's score/last_accessed will
+                    // be refreshed by the very next ordinary Hit on this (by definition
+                    // hot) key, and the extra fetch_from_origin call is accepted as
+                    // bounded, non-corrupting wasted work rather than a correctness bug.
+                    if let Some(&idx) = shard.main_cache_map.get(&requested_resource) {
+                        return shard.entries[idx].1.payload.clone();
+                    }
+
+                    let evicted = if shard.entries.len() >= shard.capacity {
+                        shard.execute_eviction_tournament(self.clock.now_millis(), &self.config)
+                    } else {
+                        None
+                    };
+
+                    let idx = shard.entries.len();
+                    shard.entries.push((
+                        requested_resource.clone(),
+                        MainCacheEntry {
+                            payload: payload.clone(),
+                            meta,
+                        },
+                    ));
+                    shard.main_cache_map.insert(requested_resource.clone(), idx);
+                    // The ghost entry may already have been evicted while the fetch was in
+                    // flight; removal is a no-op then.
+                    shard.remove_ghost(&requested_resource);
+                    evicted
+                };
+
+                // Told only after the shard lock is released, so the listener may re-enter.
+                if let (Some(key), Some(listener)) = (evicted, &self.eviction_listener) {
+                    (listener.0)(&key);
                 }
-
-                if shard.entries.len() >= shard.capacity {
-                    shard.execute_eviction_tournament(self.clock.now_millis(), &self.config);
-                }
-
-                let idx = shard.entries.len();
-                shard.entries.push((
-                    requested_resource.clone(),
-                    MainCacheEntry {
-                        payload: payload.clone(),
-                        meta,
-                    },
-                ));
-                shard.main_cache_map.insert(requested_resource.clone(), idx);
-                // The ghost entry may already have been evicted while the fetch was in
-                // flight; removal is a no-op then.
-                shard.remove_ghost(&requested_resource);
-
                 payload
             }
             Action::GhostHit | Action::Miss => fetch_from_origin(&requested_resource).await,

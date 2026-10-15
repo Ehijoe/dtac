@@ -1,5 +1,5 @@
-use crate::cache_engine::DtacCacheEngine;
 use crate::cache_engine::config::EngineConfig;
+use crate::cache_engine::{DtacCacheEngine, EvictionListener};
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::heuristic_router::HeuristicRouter;
@@ -38,6 +38,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
             router: None,
             clock: None,
             engine_config: EngineConfig::default(),
+            eviction_listener: None,
             _types: PhantomData,
         }
     }
@@ -181,6 +182,7 @@ pub struct DtacCacheBuilder<K, P> {
     router: Option<HeuristicRouter>,
     clock: Option<Arc<dyn Clock>>,
     engine_config: EngineConfig,
+    eviction_listener: Option<EvictionListener<K>>,
     // `fn() -> _` keeps the builder `Send + Sync` regardless of `K` and `P`.
     _types: PhantomData<fn() -> (K, P)>,
 }
@@ -192,6 +194,7 @@ impl<K, P> fmt::Debug for DtacCacheBuilder<K, P> {
             .field("router", &self.router)
             .field("clock", &self.clock)
             .field("engine_config", &self.engine_config)
+            .field("eviction_listener", &self.eviction_listener.is_some())
             .finish()
     }
 }
@@ -224,6 +227,14 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheBuilder<K, P> {
         Ok(self)
     }
 
+    /// Calls `listener` with every key evicted from the main cache. See
+    /// [`DtacCacheEngine::with_eviction_listener`].
+    #[must_use]
+    pub fn eviction_listener(mut self, listener: EvictionListener<K>) -> Self {
+        self.eviction_listener = Some(listener);
+        self
+    }
+
     /// Builds the cache. The router and the engine share one clock.
     pub fn build(self) -> DtacCache<K, P> {
         let mut router = self.router.unwrap_or_default();
@@ -234,9 +245,10 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheBuilder<K, P> {
             }
             None => router.clock().clone(),
         };
-        DtacCache::from_parts(
-            DtacCacheEngine::build(self.capacity, self.engine_config, clock),
-            router,
-        )
+        let mut engine = DtacCacheEngine::build(self.capacity, self.engine_config, clock);
+        if let Some(listener) = self.eviction_listener {
+            engine = engine.with_eviction_listener(listener);
+        }
+        DtacCache::from_parts(engine, router)
     }
 }
