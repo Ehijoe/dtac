@@ -81,3 +81,31 @@ async fn access_decays_on_the_shared_clock() {
     let halved = cache.engine().debug_score(&key).unwrap();
     assert!((halved - fresh / 2.0).abs() < f32::EPSILON);
 }
+
+#[tokio::test]
+async fn access_with_stats_reports_hit_consistently_with_fetches() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let cache = DtacCache::<String, String>::builder(1024)
+        .clock(Arc::new(ManualClock::new(0)))
+        .build();
+    let key = "/item/1".to_string();
+    let fetches = AtomicUsize::new(0);
+
+    // Miss, ghost hit + promotion, then main-cache hits.
+    for _ in 0..5 {
+        let before = fetches.load(Ordering::Relaxed);
+        let (payload, stats) = cache
+            .access_with_stats(key.clone(), request(), |_k| {
+                fetches.fetch_add(1, Ordering::Relaxed);
+                async { "p".to_string() }
+            })
+            .await;
+        assert_eq!(payload, "p");
+        let did_fetch = fetches.load(Ordering::Relaxed) > before;
+        assert_eq!(stats.hit, !did_fetch);
+        assert!((0.0..=1.0).contains(&stats.bot_prob));
+    }
+    // A human key is promoted after a few requests, so some of them were hits.
+    assert!(fetches.load(Ordering::Relaxed) < 5);
+}

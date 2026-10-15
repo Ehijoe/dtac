@@ -17,7 +17,7 @@ mod sync;
 pub mod types;
 
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use dtac_cache::{DtacCache, DtacCacheBuilder};
+pub use dtac_cache::{AccessStats, DtacCache, DtacCacheBuilder};
 pub use heuristic_router::HeuristicRouter;
 pub use heuristic_router::asn_db::AsnDatabase;
 pub use heuristic_router::config::RouterConfig;

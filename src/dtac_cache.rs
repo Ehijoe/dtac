@@ -10,7 +10,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
 /// Combined DTAC component containing both the Cache Engine and Heuristic Router
@@ -87,6 +87,23 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
         F: FnOnce(&K) -> Fut,
         Fut: Future<Output = P>,
     {
+        self.access_with_stats(requested_resource, request_data, fetch_from_origin)
+            .await
+            .0
+    }
+
+    /// Like [`access`](Self::access), but also returns what happened: whether it was a
+    /// hit, the request's bot probability and how long each phase took.
+    pub async fn access_with_stats<F, Fut>(
+        &self,
+        requested_resource: K,
+        request_data: RequestData,
+        fetch_from_origin: F,
+    ) -> (P, AccessStats)
+    where
+        F: FnOnce(&K) -> Fut,
+        Fut: Future<Output = P>,
+    {
         let start_time = Instant::now();
 
         debug!("Processing request for resource");
@@ -99,6 +116,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
             .evaluate_request(&request_data)
             .await
             .map_or(0.5, |score| score.value() as f32);
+        let router_time = start_time.elapsed();
 
         // Track whether it was a hit or miss
         let mut was_hit = true;
@@ -112,7 +130,8 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
             })
             .await;
 
-        let duration = start_time.elapsed().as_secs_f64();
+        let total_time = start_time.elapsed();
+        let duration = total_time.as_secs_f64();
 
         if was_hit {
             self.hits_counter.add(1, &[]);
@@ -131,8 +150,27 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
             "Request processed"
         );
 
-        result
+        let stats = AccessStats {
+            hit: was_hit,
+            bot_prob: request_bot_prob,
+            router_time,
+            engine_time: total_time.saturating_sub(router_time),
+        };
+        (result, stats)
     }
+}
+
+/// What happened during one [`DtacCache::access_with_stats`] call.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AccessStats {
+    /// Whether the request was served without calling `fetch_from_origin`.
+    pub hit: bool,
+    /// The router's bot probability for the request, in `[0, 1]`.
+    pub bot_prob: f32,
+    /// Time spent scoring the request in the router (`T_proxy`).
+    pub router_time: Duration,
+    /// Time spent in the cache engine, including any origin fetch (`T_cache`).
+    pub engine_time: Duration,
 }
 
 /// Builder for [`DtacCache`], created by [`DtacCache::builder`].
