@@ -33,6 +33,22 @@ async fn test_heuristic_router_evaluate_request() {
     assert!(score.value() >= 0.0 && score.value() <= 1.0);
 }
 
+#[tokio::test]
+async fn tracked_ips_counts_distinct_clients() {
+    let router = HeuristicRouter::new();
+    assert_eq!(router.tracked_ips(), 0);
+    for ip in ["24.0.0.1", "24.0.0.2", "24.0.0.1"] {
+        let req = RequestData {
+            ip_address: ip.parse().unwrap(),
+            path: "/item/1".to_string(),
+            method: "GET".to_string(),
+            headers: HashMap::new(),
+        };
+        router.evaluate_request(&req).await.unwrap();
+    }
+    assert_eq!(router.tracked_ips(), 2);
+}
+
 mod asn_and_shy_guys {
     #![allow(clippy::unwrap_used)]
 

@@ -93,6 +93,11 @@ impl HeuristicRouter {
         &self.clock
     }
 
+    /// The number of IPs whose state the router currently tracks, for memory reporting.
+    pub fn tracked_ips(&self) -> usize {
+        self.space_saver.len()
+    }
+
     /// Shared constructor; `config` must already be valid.
     fn build(config: RouterConfig, asn_db: AsnDatabase) -> Self {
         let meter = global::meter("dtac");

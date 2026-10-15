@@ -166,6 +166,16 @@ impl SpaceSaver {
         }
     }
 
+    /// The number of IPs currently tracked (at most the capacity).
+    pub fn len(&self) -> usize {
+        lock(&self.state).lookup.len()
+    }
+
+    /// Whether no IP is tracked yet.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Fetches the state for `client_ip`. If it doesn't exist, adds it.
     /// If memory is full, evicts the lowest-volume IP.
     pub fn get_or_add_and_evict(&self, client_ip: IpAddr) -> IpState {
