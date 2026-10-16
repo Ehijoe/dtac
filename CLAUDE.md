@@ -73,20 +73,41 @@ through the cache engine in-process with Rust (no real network calls).
 
 ```bash
 # 1. Generate NDJSON traffic logs into benchmark_logs/ (requires numpy; see scripts/requirements.txt)
-python scripts/generate_logs.py
+python scripts/generate_logs.py --seed 1 --workload both     # --legacy: the pre-plan-003 model
+(cd scripts && python -m unittest test_generate_logs)        # generator tests (~20 s)
 
 # 2. Replay a log directly against the cache engine and print a benchmark report
 cargo run --release --bin replay_bench -- --file benchmark_logs/traffic_mixed_30pct_bot.ndjson \
-    --capacity 10000 --concurrency 128
+    --capacity 10000 --concurrency 128 --asn-db data/asn/ip2asn-fixture.tsv --json-out /tmp/r.json
 ```
 
-`generate_logs.py` produces a Zipfian-distributed "catalog" of items requested by synthetic human
-traffic (bursty, realistic headers, occasional secondary asset fetch) interleaved with bot traffic
-(mechanical timing, stripped headers) at configurable bot ratios (10/30/50/75%) into
-`benchmark_logs/*.ndjson`. `replay_bench` streams those records concurrently through a real
-`DtacCache` instance and reports overall/human/bot hit rates and throughput — this is the main tool
-for evaluating whether router+cache tuning actually improves bot resistance without hurting human
-hit rate.
+`generate_logs.py` (argparse; `--seed`, `--out-dir`, `--ratios`, `--workload {naive,stealthy,both}`,
+session/bot/size parameters) builds one shared human stream per seed: Zipf-catalog multi-page
+sessions, one IP each, exponential think time, a favicon for new visitors only
+(`--returning-frac`), optional NAT. It reuses that stream in every ratio file and both workloads.
+For each ratio it adds `B = H·r/(1−r)` bots spread evenly over the measurement window, so the bot
+share is stationary:
+- naive bots (`traffic_mixed_*`): a pool that grows with the ratio, each IP sending at
+  `--bot-ip-rate`, IPs in the fixture's datacenter ranges or TEST-NET;
+- stealthy bots (`traffic_stealthy_*`): browser headers, rotating residential IPs, one favicon per
+  IP.
+
+Every record has a deterministic per-item `size_bytes`; humans carry `visitor`, bots `bot_kind`.
+Each `.ndjson` gets a `.meta.json` sidecar (seed, args, git commit). `--legacy` reproduces the old
+generator byte for byte (its code is kept verbatim in the same file); don't change it.
+
+`replay_bench` streams records concurrently through a real `DtacCache` (or `--algorithm lru`)
+and reports:
+- human/overall/bot hit rate and Byte Hit Rate;
+- `T_proxy`/`T_cache`/total latency percentiles (hdrhistogram);
+- memory (peak RSS, RSS delta, structure sizes, logical resident bytes);
+- eviction-by-admitter counts and the Cache Pollution Index;
+- the router as a classifier (ROC-AUC, precision/recall/FPR, new vs. returning visitor FPR).
+
+`--json-out` writes all of it plus the run config and the log's `.meta.json`, and plan 004
+consumes that file. `--quiet` hides the progress bar and the Prometheus dump. This is the main
+tool for evaluating whether router+cache tuning actually improves bot resistance without hurting
+human hit rate.
 
 ## Architecture
 
@@ -181,13 +202,17 @@ All engine constants are in `EngineConfig` (`src/cache_engine/config.rs`, serde-
 validated by `DtacCacheEngine::with_config`). Defaults reproduce the original hard-coded behaviour and
 are provisional until plan 004's calibration.
 
+`DtacCacheEngine::with_eviction_listener` takes an `Arc<dyn Fn(&K)>` called with every main-cache
+victim *after* the shard lock is released (collect victims inside the lock, notify outside), and
+`resident_keys()` lists main-cache keys (diagnostics only, like `debug_integrity_counts`).
+
 `DtacCacheEngine::access` takes a `fetch_from_origin` closure and only calls it on an actual miss or
 promotion — hits and ghost-hits return without touching the closure. The lock is held only for the
 cache-state transition decision; the async `fetch_from_origin` call happens *outside* the lock
 (`Action` enum marks what to do after releasing it), so origin fetches never block other shard access.
 
-`DtacCache::builder(capacity).router(router).clock(clock).engine_config(cfg)?.build()` is how custom
-parts are injected; the builder passes one shared clock to both router and engine (the router's own
+`DtacCache::builder(capacity).router(router).clock(clock).engine_config(cfg)?.eviction_listener(f).build()`
+is how custom parts are injected; the builder passes one shared clock to both router and engine (the router's own
 clock if `.clock` isn't called). `DtacCache::new(capacity)` is shorthand for the defaults.
 
 ### Binaries (`src/bin/`)
@@ -197,13 +222,25 @@ clock if `.clock` isn't called). `DtacCache::new(capacity)` is shorthand for the
   through a Prometheus registry at `/metrics`. Note the client IP is currently hardcoded to
   `127.0.0.1` rather than extracted from the connection/`X-Forwarded-For` — this means the ASN and
   per-IP velocity heuristics are not meaningfully exercised when actually running this binary.
-- **`replay_bench.rs`**: in-process benchmark harness (see Benchmarking pipeline above). Deserializes
-  NDJSON into memory up front, then dispatches `DtacCache::access` calls paced by logged timestamps
-  (scaled by `--speed`) as `JoinSet` tasks bounded by a semaphore (`--concurrency`), tracking separate hit/miss counters for
-  `human`/`bot`-labeled records so cache effectiveness can be compared across bot-traffic ratios.
-  `--clock log` (default) sets a shared `ManualClock` to each record's timestamp before its access,
-  so `--speed` only affects run time; `--clock wall` reproduces the old wall-clock behaviour.
-  `--engine-config`/`--router-config` (JSON) and `--ghost-multiplier` set any constant.
+- **`replay_bench/`**: in-process benchmark harness (see Benchmarking pipeline above).
+  - `main.rs`: CLI, `LogRecord`, the dispatch loop, `--json-out`. It keeps the NDJSON log in
+    memory and dispatches `DtacCache::access_with_stats` calls (`AccessStats`: hit, `bot_prob`,
+    router/engine time) as `JoinSet` tasks. Calls are paced by logged timestamps (scaled by
+    `--speed`) and bounded by a semaphore (`--concurrency`). Each task gets a clone of its record,
+    and finished tasks are reaped in the loop, so the log stays resident and the RSS delta
+    measures the cache. `--clock log` (default) sets a shared `ManualClock` to each record's
+    timestamp before its access, so `--speed` only affects run time; `--clock wall` reproduces
+    the old wall-clock behaviour. `--engine-config`/`--router-config` (JSON) and
+    `--ghost-multiplier` set any constant.
+  - `metrics.rs`: `BenchMetrics` atomics, `Striped<T>` (per-record-sequence mutex stripes for
+    the latency histograms and classifier samples), and the `Report` (Serialize) that is both
+    printed and written to `--json-out`.
+  - `engines.rs`: the `Engine` enum and the sharded `BaselineLruEngine`. Plan 004 adds more
+    engines here.
+  - `classifier.rs`: router quality (AUC by sorting, threshold metrics, histograms).
+  - `pollution.rs`: the per-key `Ledger` behind eviction-by-admitter and the CPI. It records the
+    label of each key's latest origin fetch and whether a human has requested the key since.
+  - Payloads are slices of one preallocated buffer sized by each record's `size_bytes`.
 
 ### Observability
 
