@@ -1,6 +1,7 @@
 //! Counters collected during a replay and the final report.
 
 use crate::Algorithm;
+use crate::classifier::{ClassifierReport, Sample};
 use hdrhistogram::Histogram;
 use prometheus::{Encoder, TextEncoder};
 use serde::Serialize;
@@ -123,6 +124,9 @@ pub struct BenchMetrics {
     // Timing
     pub total_duration_us: AtomicU64,
     pub latency: Striped<PhaseHistograms>,
+
+    // Router scores against ground truth (DTAC only)
+    pub classifier: Striped<Vec<Sample>>,
 }
 
 impl BenchMetrics {
@@ -290,6 +294,8 @@ pub struct Report {
     pub bot: ClassReport,
     pub overall: ClassReport,
     pub latency: LatencyReport,
+    /// `None` for the baselines, which don't score requests.
+    pub classifier: Option<ClassifierReport>,
 }
 
 impl Report {
@@ -322,6 +328,12 @@ impl Report {
                 load(&m.total_miss_bytes),
             ),
             latency: LatencyReport::new(&m.latency),
+            classifier: {
+                let mut samples = Vec::new();
+                m.classifier
+                    .for_each(|stripe| samples.extend_from_slice(stripe));
+                ClassifierReport::new(&samples)
+            },
         }
     }
 
@@ -380,6 +392,10 @@ impl Report {
         println!("(byte hit rates: capacity counts entries and no engine is size-aware)");
         println!("--------------------------------------------------------");
         self.latency.print();
+        if let Some(classifier) = &self.classifier {
+            println!("--------------------------------------------------------");
+            classifier.print();
+        }
         println!("========================================================");
     }
 }

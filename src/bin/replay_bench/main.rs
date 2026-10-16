@@ -1,11 +1,13 @@
 //! Replay script that doesn't make network requests for benchmarking
 
+mod classifier;
 #[path = "../common/mod.rs"]
 mod common;
 mod engines;
 mod metrics;
 
 use clap::Parser;
+use classifier::{Label, Sample};
 use common::AsnArgs;
 use dtac::cache_engine::config::EngineConfig;
 use dtac::clock::ManualClock;
@@ -428,6 +430,11 @@ async fn replay_record(record: LogRecord, seq: usize, ctx: &ReplayCtx) {
     }
 
     let path = record.path.clone();
+    let label = Label::of(
+        &record.traffic_type,
+        record.visitor.as_deref(),
+        record.bot_kind.as_deref(),
+    );
 
     // Closure triggered ONLY on a cache miss
     let fetch_from_origin = |_key: &String| {
@@ -458,6 +465,13 @@ async fn replay_record(record: LogRecord, seq: usize, ctx: &ReplayCtx) {
             let (_, stats) = cache
                 .access_with_stats(path, req_data, fetch_from_origin)
                 .await;
+            if is_measurement {
+                let sample = Sample {
+                    bot_prob: stats.bot_prob,
+                    label,
+                };
+                metrics.classifier.with(seq, |samples| samples.push(sample));
+            }
             Some((stats.router_time, stats.engine_time))
         }
         Engine::Lru(baseline) => {
