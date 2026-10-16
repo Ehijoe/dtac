@@ -18,7 +18,9 @@ use dtac::heuristic_router::config::RouterConfig;
 use dtac::types::RequestData;
 use engines::{BaselineLruEngine, Engine};
 use indicatif::{ProgressBar, ProgressStyle};
-use metrics::{BenchMetrics, Report, init_metrics, print_prometheus};
+use metrics::{
+    BenchMetrics, MemoryReport, Report, init_metrics, print_prometheus, proc_status_bytes,
+};
 use pollution::Origin;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -529,12 +531,16 @@ fn progress_bar(quiet: bool, len: usize) -> Result<ProgressBar, Box<dyn std::err
 
 /// Replays every record and returns the wall time of the measurement phase.
 ///
+/// Each task gets a clone of its record (made here, outside the timed region), so the
+/// loaded log stays resident for the whole replay and the RSS delta measures what the
+/// cache and the bench accumulated rather than log records being freed.
+///
 /// Records are dispatched paced by their logged timestamps (scaled by `--speed`), while a
 /// semaphore bounds how many may be in flight at once -- decoupling "when a request is
 /// paced to start" from "how many are concurrently executing," matching a real traffic
 /// replay.
 async fn dispatch(
-    records: Vec<LogRecord>,
+    records: &[LogRecord],
     ctx: &Arc<ReplayCtx>,
     args: &Args,
     pb: &ProgressBar,
@@ -546,7 +552,7 @@ async fn dispatch(
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let mut join_set = tokio::task::JoinSet::new();
 
-    for (seq, record) in records.into_iter().enumerate() {
+    for (seq, record) in records.iter().enumerate() {
         sleep_until(target_instant(bench_start, record.timestamp, args.speed)).await;
 
         // Warm-up records still exercise the real cache (below) so it gets
@@ -573,6 +579,10 @@ async fn dispatch(
         // where the dispatch loop will stall waiting for a free slot --
         // intentional backpressure, not a bug.
         let permit = semaphore.clone().acquire_owned().await?;
+        let record = record.clone();
+        // A JoinSet keeps finished tasks until they are joined; reap them as we go so
+        // memory (and the RSS delta) doesn't grow with the length of the log.
+        while join_set.try_join_next().is_some() {}
         let ctx = ctx.clone();
         let pb = pb.clone();
 
@@ -591,6 +601,34 @@ async fn dispatch(
 
     pb.finish_with_message("Replay Complete");
     Ok(start_time.elapsed())
+}
+
+/// Memory use at the end of the replay and the size of each structure.
+fn memory_report(engine: &Engine, rss_before_replay: Option<u64>, report: &Report) -> MemoryReport {
+    let rss_after_replay = proc_status_bytes("VmRSS");
+    let rss_delta = rss_before_replay
+        .zip(rss_after_replay)
+        .and_then(|(before, after)| Some(i64::try_from(after).ok()? - i64::try_from(before).ok()?));
+    let (main_entries, ghost_entries, ghost_capacity_per_shard, tracked_ips) = match engine {
+        Engine::Dtac(cache) => (
+            cache.engine().len(),
+            Some(cache.engine().ghost_len()),
+            Some(cache.engine().ghost_capacity_per_shard()),
+            Some(cache.router().tracked_ips()),
+        ),
+        Engine::Lru(_) => (engine.resident_keys().len(), None, None, None),
+    };
+    MemoryReport {
+        peak_rss_bytes: proc_status_bytes("VmHWM"),
+        rss_before_replay_bytes: rss_before_replay,
+        rss_after_replay_bytes: rss_after_replay,
+        rss_delta_bytes: rss_delta,
+        main_entries,
+        ghost_entries,
+        ghost_capacity_per_shard,
+        tracked_ips,
+        logical_resident_bytes: report.pollution.as_ref().map(|p| p.resident_bytes_final),
+    }
 }
 
 /// Writes the report and the run configuration to `path` (`--json-out`).
@@ -668,22 +706,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Replay
     let pb = progress_bar(args.quiet, records.len())?;
-    let total_wall_time = dispatch(records, &ctx, &args, &pb).await?;
+    let rss_before_replay = proc_status_bytes("VmRSS");
+    let total_wall_time = dispatch(&records, &ctx, &args, &pb).await?;
 
     // 5. Gather and compute final statistics
-    let report = Report::new(&ctx.metrics, total_wall_time);
+    let mut report = Report::new(&ctx.metrics, total_wall_time);
+    report.memory = Some(memory_report(&ctx.engine, rss_before_replay, &report));
+    drop(records); // only now, so the log stays resident across both RSS readings
     report.print(args.algorithm);
     if !args.quiet {
         print_prometheus(&registry);
-    }
-    if let Engine::Dtac(cache) = &ctx.engine {
-        // Metadata overhead: the ghost cache holds keys and scores but no payloads.
-        println!(
-            "Final cache entries: {} main, {} ghost (bound {} per shard)",
-            cache.engine().len(),
-            cache.engine().ghost_len(),
-            cache.engine().ghost_capacity_per_shard()
-        );
     }
     if let Some(path) = &args.json_out {
         write_json_out(path, &args, &ctx.engine, &report)?;

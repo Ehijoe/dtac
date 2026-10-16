@@ -288,6 +288,85 @@ impl LatencyReport {
     }
 }
 
+/// A `/proc/self/status` field in bytes (`VmRSS`, `VmHWM`, ...). Linux only; `None`
+/// elsewhere or if the field is missing.
+pub fn proc_status_bytes(field: &str) -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| {
+        line.strip_prefix(field)
+            .is_some_and(|rest| rest.starts_with(':'))
+    })?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
+}
+
+/// Memory use and structure sizes at the end of the replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemoryReport {
+    /// Peak resident set size of the whole process (`VmHWM`), log records included.
+    pub peak_rss_bytes: Option<u64>,
+    /// RSS once the log was loaded and the cache built, before the replay.
+    pub rss_before_replay_bytes: Option<u64>,
+    pub rss_after_replay_bytes: Option<u64>,
+    /// RSS growth over the replay: cache metadata (main/ghost maps, `SpaceSaver`) plus the
+    /// bench's own bookkeeping (CPI ledger, classifier samples, histograms). Payloads are
+    /// slices of one shared buffer and add almost nothing.
+    pub rss_delta_bytes: Option<i64>,
+    pub main_entries: usize,
+    /// DTAC only.
+    pub ghost_entries: Option<usize>,
+    /// DTAC only: the ghost-cache bound per shard.
+    pub ghost_capacity_per_shard: Option<usize>,
+    /// DTAC only: IPs the router's `SpaceSaver` tracks.
+    pub tracked_ips: Option<usize>,
+    /// Sum of `size_bytes` over the resident keys: what the payloads would cost if they
+    /// weren't shared slices.
+    pub logical_resident_bytes: Option<u64>,
+}
+
+impl MemoryReport {
+    pub fn print(&self) {
+        let mib = |bytes: u64| {
+            // Byte counts are far below 2^52, so f64 is exact here.
+            #[allow(clippy::cast_precision_loss)]
+            let mib = bytes as f64 / (1024.0 * 1024.0);
+            mib
+        };
+        println!("MEMORY");
+        if let (Some(peak), Some(delta)) = (self.peak_rss_bytes, self.rss_delta_bytes) {
+            println!(
+                "Peak RSS:               {:.1} MiB (log records included)",
+                mib(peak)
+            );
+            // A negative delta is possible if the allocator returned memory to the OS.
+            #[allow(clippy::cast_precision_loss)]
+            let delta_mib = delta as f64 / (1024.0 * 1024.0);
+            println!("RSS delta over replay:  {delta_mib:+.1} MiB (metadata + bench bookkeeping)");
+        } else {
+            println!("RSS:                    n/a (needs Linux /proc/self/status)");
+        }
+        let ghost = self.ghost_entries.map_or_else(String::new, |ghost| {
+            format!(
+                ", {ghost} ghost (bound {} per shard)",
+                self.ghost_capacity_per_shard.unwrap_or_default()
+            )
+        });
+        println!("Cache entries:          {} main{ghost}", self.main_entries);
+        if let Some(ips) = self.tracked_ips {
+            println!("SpaceSaver IPs:         {ips}");
+        }
+        if let Some(bytes) = self.logical_resident_bytes {
+            println!(
+                "Logical resident bytes: {:.1} MiB (payloads are shared slices, not in RSS)",
+                mib(bytes)
+            );
+        }
+    }
+}
+
 /// Everything a replay measured, as printed and as written to `--json-out`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
@@ -302,6 +381,8 @@ pub struct Report {
     pub classifier: Option<ClassifierReport>,
     /// `None` if no CPI sample was taken.
     pub pollution: Option<PollutionReport>,
+    /// Filled in by the caller, which knows the engine.
+    pub memory: Option<MemoryReport>,
 }
 
 impl Report {
@@ -341,6 +422,7 @@ impl Report {
                 ClassifierReport::new(&samples)
             },
             pollution: PollutionReport::new(&m.ledger),
+            memory: None,
         }
     }
 
@@ -399,6 +481,10 @@ impl Report {
         println!("(byte hit rates: capacity counts entries and no engine is size-aware)");
         println!("--------------------------------------------------------");
         self.latency.print();
+        if let Some(memory) = &self.memory {
+            println!("--------------------------------------------------------");
+            memory.print();
+        }
         if let Some(pollution) = &self.pollution {
             println!("--------------------------------------------------------");
             pollution.print();
@@ -451,6 +537,19 @@ mod tests {
         assert!((report.human.byte_hit_rate - 1.0).abs() < 1e-12);
         assert!(report.bot.byte_hit_rate.abs() < 1e-12);
         assert_eq!(report.bot.bytes, 1000);
+    }
+
+    #[test]
+    fn proc_status_reports_rss_on_linux() {
+        let rss = proc_status_bytes("VmRSS");
+        let peak = proc_status_bytes("VmHWM");
+        if cfg!(target_os = "linux") {
+            assert!(rss.unwrap() > 0);
+            assert!(peak.unwrap() >= rss.unwrap() / 2);
+        } else {
+            assert_eq!((rss, peak), (None, None));
+        }
+        assert_eq!(proc_status_bytes("NoSuchField"), None);
     }
 
     #[test]
