@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Measurement-phase counters, shared by every replay task.
 #[derive(Default)]
 pub struct BenchMetrics {
     // Total counters
@@ -18,8 +19,40 @@ pub struct BenchMetrics {
     pub bot_requests: AtomicU64,
     pub bot_misses: AtomicU64,
 
+    // Bytes requested and bytes fetched from origin, for the byte hit rate
+    pub total_bytes: AtomicU64,
+    pub total_miss_bytes: AtomicU64,
+    pub human_bytes: AtomicU64,
+    pub human_miss_bytes: AtomicU64,
+
     // Timing
     pub total_duration_us: AtomicU64,
+}
+
+impl BenchMetrics {
+    /// Counts one measurement request for an item of `size` bytes.
+    pub fn record_request(&self, is_bot: bool, size: u64) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        self.total_bytes.fetch_add(size, Ordering::Relaxed);
+        if is_bot {
+            self.bot_requests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.human_requests.fetch_add(1, Ordering::Relaxed);
+            self.human_bytes.fetch_add(size, Ordering::Relaxed);
+        }
+    }
+
+    /// Counts one origin fetch of `size` bytes for a measurement request.
+    pub fn record_miss(&self, is_bot: bool, size: u64) {
+        self.cache_miss_fetches.fetch_add(1, Ordering::Relaxed);
+        self.total_miss_bytes.fetch_add(size, Ordering::Relaxed);
+        if is_bot {
+            self.bot_misses.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.human_misses.fetch_add(1, Ordering::Relaxed);
+            self.human_miss_bytes.fetch_add(size, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Routes the library's OpenTelemetry metrics into a fresh Prometheus registry.
@@ -54,16 +87,30 @@ pub struct ClassReport {
     pub misses: u64,
     /// `hits / requests`, in `[0, 1]`.
     pub hit_rate: f64,
+    /// Bytes requested.
+    pub bytes: u64,
+    /// Bytes fetched from origin.
+    pub miss_bytes: u64,
+    /// Byte hit rate, `1 - miss_bytes / bytes`. Capacity counts entries, not bytes, and no
+    /// engine is size-aware, so this only reflects how hits happen to correlate with size.
+    pub byte_hit_rate: f64,
 }
 
 impl ClassReport {
-    pub fn new(requests: u64, misses: u64) -> Self {
+    pub fn new(requests: u64, misses: u64, bytes: u64, miss_bytes: u64) -> Self {
         let hits = requests.saturating_sub(misses);
         Self {
             requests,
             hits,
             misses,
             hit_rate: ratio(hits, requests),
+            bytes,
+            miss_bytes,
+            byte_hit_rate: if bytes == 0 {
+                0.0
+            } else {
+                1.0 - ratio(miss_bytes, bytes)
+            },
         }
     }
 }
@@ -90,9 +137,24 @@ impl Report {
             elapsed_s: elapsed.as_secs_f64(),
             throughput_rps: total_requests as f64 / elapsed.as_secs_f64(),
             avg_access_time_us: ratio(load(&m.total_duration_us), total_requests),
-            human: ClassReport::new(load(&m.human_requests), load(&m.human_misses)),
-            bot: ClassReport::new(load(&m.bot_requests), load(&m.bot_misses)),
-            overall: ClassReport::new(total_requests, load(&m.cache_miss_fetches)),
+            human: ClassReport::new(
+                load(&m.human_requests),
+                load(&m.human_misses),
+                load(&m.human_bytes),
+                load(&m.human_miss_bytes),
+            ),
+            bot: ClassReport::new(
+                load(&m.bot_requests),
+                load(&m.bot_misses),
+                load(&m.total_bytes).saturating_sub(load(&m.human_bytes)),
+                load(&m.total_miss_bytes).saturating_sub(load(&m.human_miss_bytes)),
+            ),
+            overall: ClassReport::new(
+                total_requests,
+                load(&m.cache_miss_fetches),
+                load(&m.total_bytes),
+                load(&m.total_miss_bytes),
+            ),
         }
     }
 
@@ -123,6 +185,7 @@ impl Report {
             human.hits,
             human.misses
         );
+        println!("Human Byte Hit Rate:    {:.2}%", pct(human.byte_hit_rate));
         println!("--------------------------------------------------------");
         println!("SECONDARY METRIC");
         println!("Total Requests:         {}", overall.requests);
@@ -136,6 +199,7 @@ impl Report {
             overall.misses,
             100.0 - pct(overall.hit_rate)
         );
+        println!("Overall Byte Hit Rate:  {:.2}%", pct(overall.byte_hit_rate));
         println!("--------------------------------------------------------");
         println!("FOR REFERENCE ONLY -- not an optimization target");
         println!("Bot Requests:           {}", bot.requests);
@@ -145,6 +209,8 @@ impl Report {
             bot.hits,
             bot.misses
         );
+        println!("Bot Byte Hit Rate:      {:.2}%", pct(bot.byte_hit_rate));
+        println!("(byte hit rates: capacity counts entries and no engine is size-aware)");
         println!("========================================================");
     }
 }
@@ -168,9 +234,26 @@ mod tests {
 
     #[test]
     fn class_report_derives_hits_and_rate() {
-        let r = ClassReport::new(10, 4);
+        let r = ClassReport::new(10, 4, 0, 0);
         assert_eq!((r.hits, r.misses), (6, 4));
         assert!((r.hit_rate - 0.6).abs() < 1e-12);
-        assert!(ClassReport::new(0, 0).hit_rate.abs() < f64::EPSILON);
+        assert!(ClassReport::new(0, 0, 0, 0).hit_rate.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn byte_hit_rate_weights_by_size() {
+        // Two hits on 100-byte items, one miss on a 1000-byte item: 2/3 of requests hit,
+        // but only 200 of 1200 bytes did.
+        let m = BenchMetrics::default();
+        m.record_request(false, 100);
+        m.record_request(false, 100);
+        m.record_request(true, 1000);
+        m.record_miss(true, 1000);
+        let report = Report::new(&m, Duration::from_secs(1));
+        assert!((report.overall.hit_rate - 2.0 / 3.0).abs() < 1e-12);
+        assert!((report.overall.byte_hit_rate - 200.0 / 1200.0).abs() < 1e-12);
+        assert!((report.human.byte_hit_rate - 1.0).abs() < 1e-12);
+        assert!(report.bot.byte_hit_rate.abs() < 1e-12);
+        assert_eq!(report.bot.bytes, 1000);
     }
 }

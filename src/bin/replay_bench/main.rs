@@ -70,7 +70,8 @@ struct Args {
     #[arg(short = 'j', long, default_value_t = 128)]
     concurrency: usize,
 
-    /// Simulated payload size in bytes returned on cache miss
+    /// Payload size in bytes returned on a cache miss for records without
+    /// `size_bytes` (logs from before variable sizes)
     #[arg(short = 's', long, default_value_t = 1024)]
     payload_size: usize,
 
@@ -294,6 +295,40 @@ struct LogRecord {
     ip: String,
     #[serde(default = "default_phase")]
     phase: Phase,
+    /// Payload size of the requested item; absent in older logs.
+    #[serde(default)]
+    size_bytes: Option<u64>,
+    /// `naive` or `stealthy` for bot records; absent for humans and older logs.
+    #[serde(default)]
+    bot_kind: Option<String>,
+    /// `new` or `returning` for human records; absent for bots and older logs.
+    #[serde(default)]
+    visitor: Option<String>,
+}
+
+/// Shared state every replayed record needs.
+struct ReplayCtx {
+    engine: Engine,
+    log_clock: Option<Arc<ManualClock>>,
+    metrics: Arc<BenchMetrics>,
+    /// One zeroed buffer as large as the biggest payload. Each fetch returns a `slice`
+    /// of it, so allocation doesn't distort the timings and payloads cost no RSS.
+    payload: bytes::Bytes,
+    /// Size used for records without `size_bytes`.
+    default_size: u64,
+}
+
+impl ReplayCtx {
+    /// The payload size for `record`: its `size_bytes`, or `--payload-size`.
+    fn size_of(&self, record: &LogRecord) -> u64 {
+        record.size_bytes.unwrap_or(self.default_size)
+    }
+
+    /// A payload of `size` bytes, sliced from the shared buffer.
+    fn payload_of(&self, size: u64) -> bytes::Bytes {
+        let len = usize::try_from(size).map_or(self.payload.len(), |n| n.min(self.payload.len()));
+        self.payload.slice(..len)
+    }
 }
 
 /// Parses `raw` as an `IpAddr`, falling back to `127.0.0.1` if it's missing
@@ -376,56 +411,36 @@ fn build_engine(
     })
 }
 
-/// Replays one log record through `engine` and records its outcome in `metrics`.
-async fn replay_record(
-    record: LogRecord,
-    engine: &Engine,
-    log_clock: Option<&ManualClock>,
-    metrics: &Arc<BenchMetrics>,
-    payload: bytes::Bytes,
-) {
+/// Replays one log record through the engine and records its outcome in the metrics.
+async fn replay_record(record: LogRecord, ctx: &ReplayCtx) {
+    let metrics = &ctx.metrics;
     let is_bot = record.traffic_type == "bot";
     let is_measurement = record.phase == Phase::Measurement;
+    let size = ctx.size_of(&record);
+    let payload = ctx.payload_of(size);
 
     // Track total counts per category -- warm-up records still run
     // through the real cache below, but never touch BenchMetrics.
     if is_measurement {
-        metrics.total_requests.fetch_add(1, Ordering::Relaxed);
-        if is_bot {
-            metrics.bot_requests.fetch_add(1, Ordering::Relaxed);
-        } else {
-            metrics.human_requests.fetch_add(1, Ordering::Relaxed);
-        }
+        metrics.record_request(is_bot, size);
     }
 
     let path = record.path.clone();
-    let metrics_fetch = metrics.clone();
 
     // Closure triggered ONLY on a cache miss
     let fetch_from_origin = |_key: &String| {
-        let metrics_fetch = metrics_fetch.clone();
-        let payload = payload.clone();
-        async move {
-            if is_measurement {
-                metrics_fetch
-                    .cache_miss_fetches
-                    .fetch_add(1, Ordering::Relaxed);
-                if is_bot {
-                    metrics_fetch.bot_misses.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    metrics_fetch.human_misses.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            payload
+        if is_measurement {
+            metrics.record_miss(is_bot, size);
         }
+        async move { payload }
     };
 
-    if let Some(clock) = log_clock {
+    if let Some(clock) = &ctx.log_clock {
         set_log_time(clock, record.timestamp);
     }
 
     let req_start = Instant::now();
-    let _ = match engine {
+    let _ = match &ctx.engine {
         Engine::Dtac(cache) => {
             // RequestData is only built for the Dtac arm -- the Lru
             // baseline is bot-unaware by definition, so building it
@@ -450,34 +465,12 @@ async fn replay_record(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-    if args.speed <= 0.0 {
-        eprintln!("--speed must be greater than 0.0 (got {})", args.speed);
-        std::process::exit(1);
-    }
-    init_tracing_if_requested();
-
-    // 1. Initialize Prometheus & OpenTelemetry Registry
-    let registry = init_metrics()?;
-
-    // 2. Load NDJSON records into memory
-    let records = load_records(&args.file)?;
-    let total_records = records.len();
-    println!("Loaded {total_records} records into memory.");
-    print_run_header(&args, &records);
-
-    // 3. Initialize Cache & Metrics Tracker
-    let log_clock = (args.clock == ClockMode::Log).then(|| Arc::new(ManualClock::new(0)));
-    let engine = build_engine(&args, log_clock.as_ref())?;
-    let metrics = Arc::new(BenchMetrics::default());
-    let default_payload = bytes::Bytes::from(vec![0u8; args.payload_size]);
-
-    let pb = if args.quiet {
+/// The progress bar for `len` records, hidden with `--quiet`.
+fn progress_bar(quiet: bool, len: usize) -> Result<ProgressBar, Box<dyn std::error::Error>> {
+    let pb = if quiet {
         ProgressBar::hidden()
     } else {
-        ProgressBar::new(total_records as u64)
+        ProgressBar::new(len as u64)
     };
     pb.set_style(
         ProgressStyle::default_bar()
@@ -486,17 +479,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?
             .progress_chars("#>-"),
     );
+    Ok(pb)
+}
 
+/// Replays every record and returns the wall time of the measurement phase.
+///
+/// Records are dispatched paced by their logged timestamps (scaled by `--speed`), while a
+/// semaphore bounds how many may be in flight at once -- decoupling "when a request is
+/// paced to start" from "how many are concurrently executing," matching a real traffic
+/// replay.
+async fn dispatch(
+    records: Vec<LogRecord>,
+    ctx: &Arc<ReplayCtx>,
+    args: &Args,
+    pb: &ProgressBar,
+) -> Result<Duration, Box<dyn std::error::Error>> {
     let mut start_time = Instant::now();
     let mut measurement_started = false;
     let bench_start = TokioInstant::now();
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let mut join_set = tokio::task::JoinSet::new();
 
-    // 4. Dispatch records paced by their logged timestamps (scaled by
-    //    --speed), while a semaphore bounds how many may be in flight at
-    //    once -- decoupling "when a request is paced to start" from "how
-    //    many are concurrently executing," matching a real traffic replay.
     for record in records {
         sleep_until(target_instant(bench_start, record.timestamp, args.speed)).await;
 
@@ -515,16 +518,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // where the dispatch loop will stall waiting for a free slot --
         // intentional backpressure, not a bug.
         let permit = semaphore.clone().acquire_owned().await?;
-        let engine = engine.clone();
-        let log_clock = log_clock.clone();
-        let metrics = metrics.clone();
+        let ctx = ctx.clone();
         let pb = pb.clone();
-        let payload = default_payload.clone();
 
         join_set.spawn(async move {
             let _permit = permit; // held for the duration of this task, released on completion
 
-            replay_record(record, &engine, log_clock.as_deref(), &metrics, payload).await;
+            replay_record(record, &ctx).await;
 
             pb.inc(1);
         });
@@ -534,15 +534,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while join_set.join_next().await.is_some() {}
 
     pb.finish_with_message("Replay Complete");
-    let total_wall_time = start_time.elapsed();
+    Ok(start_time.elapsed())
+}
+
+/// Writes the report and the run configuration to `path` (`--json-out`).
+fn write_json_out(
+    path: &Path,
+    args: &Args,
+    engine: &Engine,
+    report: &Report,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (router_config, engine_config) = match engine {
+        Engine::Dtac(cache) => (
+            Some(*cache.router().config()),
+            Some(*cache.engine().config()),
+        ),
+        Engine::Lru(_) => (None, None),
+    };
+    let out = JsonOut {
+        run: RunInfo {
+            file: &args.file,
+            algorithm: args.algorithm,
+            capacity: args.capacity,
+            concurrency: args.concurrency,
+            payload_size: args.payload_size,
+            speed: args.speed,
+            clock: args.clock,
+            asn_db: &args.asn.asn_db,
+            router_config,
+            engine_config,
+            log_meta: load_log_meta(&args.file)?,
+            git_commit: git_commit(),
+        },
+        results: report,
+    };
+    serde_json::to_writer_pretty(std::io::BufWriter::new(File::create(path)?), &out)?;
+    println!("Wrote {}", path.display());
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    if args.speed <= 0.0 {
+        eprintln!("--speed must be greater than 0.0 (got {})", args.speed);
+        std::process::exit(1);
+    }
+    init_tracing_if_requested();
+
+    // 1. Initialize Prometheus & OpenTelemetry Registry
+    let registry = init_metrics()?;
+
+    // 2. Load NDJSON records into memory
+    let records = load_records(&args.file)?;
+    println!("Loaded {} records into memory.", records.len());
+    print_run_header(&args, &records);
+
+    // 3. Initialize Cache & Metrics Tracker
+    let log_clock = (args.clock == ClockMode::Log).then(|| Arc::new(ManualClock::new(0)));
+    let default_size = args.payload_size as u64;
+    let max_size = records
+        .iter()
+        .filter_map(|r| r.size_bytes)
+        .fold(default_size, u64::max);
+    let ctx = Arc::new(ReplayCtx {
+        engine: build_engine(&args, log_clock.as_ref())?,
+        log_clock,
+        metrics: Arc::new(BenchMetrics::default()),
+        payload: bytes::Bytes::from(vec![0u8; usize::try_from(max_size)?]),
+        default_size,
+    });
+
+    // 4. Replay
+    let pb = progress_bar(args.quiet, records.len())?;
+    let total_wall_time = dispatch(records, &ctx, &args, &pb).await?;
 
     // 5. Gather and compute final statistics
-    let report = Report::new(&metrics, total_wall_time);
+    let report = Report::new(&ctx.metrics, total_wall_time);
     report.print(args.algorithm);
     if !args.quiet {
         print_prometheus(&registry);
     }
-    if let Engine::Dtac(cache) = &engine {
+    if let Engine::Dtac(cache) = &ctx.engine {
         // Metadata overhead: the ghost cache holds keys and scores but no payloads.
         println!(
             "Final cache entries: {} main, {} ghost (bound {} per shard)",
@@ -551,34 +624,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache.engine().ghost_capacity_per_shard()
         );
     }
-
     if let Some(path) = &args.json_out {
-        let (router_config, engine_config) = match &engine {
-            Engine::Dtac(cache) => (
-                Some(*cache.router().config()),
-                Some(*cache.engine().config()),
-            ),
-            Engine::Lru(_) => (None, None),
-        };
-        let out = JsonOut {
-            run: RunInfo {
-                file: &args.file,
-                algorithm: args.algorithm,
-                capacity: args.capacity,
-                concurrency: args.concurrency,
-                payload_size: args.payload_size,
-                speed: args.speed,
-                clock: args.clock,
-                asn_db: &args.asn.asn_db,
-                router_config,
-                engine_config,
-                log_meta: load_log_meta(&args.file)?,
-                git_commit: git_commit(),
-            },
-            results: &report,
-        };
-        serde_json::to_writer_pretty(std::io::BufWriter::new(File::create(path)?), &out)?;
-        println!("Wrote {}", path.display());
+        write_json_out(path, &args, &ctx.engine, &report)?;
     }
 
     Ok(())
@@ -612,6 +659,25 @@ mod tests {
             r#"{"timestamp":0.0,"method":"GET","path":"/x","headers":{},"traffic_type":"human"}"#;
         let record: LogRecord = serde_json::from_str(json)?;
         assert_eq!(record.phase, Phase::Measurement);
+        Ok(())
+    }
+
+    #[test]
+    fn old_records_without_sizes_or_labels_still_parse() -> Result<(), serde_json::Error> {
+        let json = r#"{"timestamp":1.5,"method":"GET","path":"/x","headers":{},"traffic_type":"bot","ip":"203.0.113.5","phase":"measurement"}"#;
+        let record: LogRecord = serde_json::from_str(json)?;
+        assert_eq!(record.size_bytes, None);
+        assert_eq!(record.bot_kind, None);
+        assert_eq!(record.visitor, None);
+        Ok(())
+    }
+
+    #[test]
+    fn new_records_carry_size_and_labels() -> Result<(), serde_json::Error> {
+        let json = r#"{"timestamp":1.5,"method":"GET","path":"/x","headers":{},"traffic_type":"bot","ip":"203.0.113.5","phase":"measurement","size_bytes":4096,"bot_kind":"stealthy"}"#;
+        let record: LogRecord = serde_json::from_str(json)?;
+        assert_eq!(record.size_bytes, Some(4096));
+        assert_eq!(record.bot_kind.as_deref(), Some("stealthy"));
         Ok(())
     }
 
