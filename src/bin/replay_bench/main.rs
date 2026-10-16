@@ -412,7 +412,9 @@ fn build_engine(
 }
 
 /// Replays one log record through the engine and records its outcome in the metrics.
-async fn replay_record(record: LogRecord, ctx: &ReplayCtx) {
+///
+/// `seq` is the record's position in the log; it picks which latency stripe to record into.
+async fn replay_record(record: LogRecord, seq: usize, ctx: &ReplayCtx) {
     let metrics = &ctx.metrics;
     let is_bot = record.traffic_type == "bot";
     let is_measurement = record.phase == Phase::Measurement;
@@ -440,7 +442,7 @@ async fn replay_record(record: LogRecord, ctx: &ReplayCtx) {
     }
 
     let req_start = Instant::now();
-    let _ = match &ctx.engine {
+    let phases = match &ctx.engine {
         Engine::Dtac(cache) => {
             // RequestData is only built for the Dtac arm -- the Lru
             // baseline is bot-unaware by definition, so building it
@@ -453,15 +455,25 @@ async fn replay_record(record: LogRecord, ctx: &ReplayCtx) {
                 method: record.method,
                 headers: record.headers,
             };
-            cache.access(path, req_data, fetch_from_origin).await
+            let (_, stats) = cache
+                .access_with_stats(path, req_data, fetch_from_origin)
+                .await;
+            Some((stats.router_time, stats.engine_time))
         }
-        Engine::Lru(baseline) => baseline.access(path, fetch_from_origin).await,
+        Engine::Lru(baseline) => {
+            baseline.access(path, fetch_from_origin).await;
+            None
+        }
     };
+    let total = req_start.elapsed();
     if is_measurement {
         metrics.total_duration_us.fetch_add(
-            u64::try_from(req_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+            u64::try_from(total.as_micros()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+        let (proxy, cache) =
+            phases.map_or((None, total), |(router, engine)| (Some(router), engine));
+        metrics.latency.with(seq, |h| h.record(proxy, cache, total));
     }
 }
 
@@ -500,7 +512,7 @@ async fn dispatch(
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let mut join_set = tokio::task::JoinSet::new();
 
-    for record in records {
+    for (seq, record) in records.into_iter().enumerate() {
         sleep_until(target_instant(bench_start, record.timestamp, args.speed)).await;
 
         // Warm-up records still exercise the real cache (below) so it gets
@@ -524,7 +536,7 @@ async fn dispatch(
         join_set.spawn(async move {
             let _permit = permit; // held for the duration of this task, released on completion
 
-            replay_record(record, &ctx).await;
+            replay_record(record, seq, &ctx).await;
 
             pb.inc(1);
         });

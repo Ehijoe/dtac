@@ -1,10 +1,105 @@
 //! Counters collected during a replay and the final report.
 
 use crate::Algorithm;
+use hdrhistogram::Histogram;
 use prometheus::{Encoder, TextEncoder};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
+
+/// Number of independently locked copies [`Striped`] keeps.
+const STRIPES: usize = 32;
+
+/// Locks `mutex`, recovering the guard if a replay task panicked while holding it.
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// [`STRIPES`] separately locked copies of `T`. Each task records into the copy picked
+/// by its record's sequence number, so recording rarely contends; the copies are merged
+/// once the replay is done.
+pub struct Striped<T> {
+    stripes: Vec<Mutex<T>>,
+}
+
+impl<T: Default> Default for Striped<T> {
+    fn default() -> Self {
+        Self {
+            stripes: (0..STRIPES).map(|_| Mutex::default()).collect(),
+        }
+    }
+}
+
+impl<T> Striped<T> {
+    /// Runs `f` on the copy for sequence number `seq`.
+    pub fn with<R>(&self, seq: usize, f: impl FnOnce(&mut T) -> R) -> R {
+        f(&mut lock(&self.stripes[seq % self.stripes.len()]))
+    }
+
+    /// Runs `f` on every copy in turn.
+    pub fn for_each(&self, mut f: impl FnMut(&T)) {
+        for stripe in &self.stripes {
+            f(&lock(stripe));
+        }
+    }
+}
+
+/// Latency histograms in nanoseconds for one stripe.
+pub struct PhaseHistograms {
+    /// `T_proxy`: time in the router. Empty for engines without one.
+    pub proxy: Histogram<u64>,
+    /// `T_cache`: time in the cache engine, including the (instant) origin fetch.
+    pub cache: Histogram<u64>,
+    /// The whole access as the bench sees it.
+    pub total: Histogram<u64>,
+}
+
+/// A histogram from 1 ns to 60 s at 2 significant digits (1% resolution), which keeps
+/// each one small enough to stripe.
+fn latency_histogram() -> Histogram<u64> {
+    // Fixed, valid bounds: `new_with_bounds` only fails for low < 1, high < 2 * low or
+    // more than 5 significant digits.
+    #[allow(clippy::expect_used)]
+    Histogram::new_with_bounds(1, 60_000_000_000, 2).expect("valid histogram bounds")
+}
+
+impl Default for PhaseHistograms {
+    fn default() -> Self {
+        Self {
+            proxy: latency_histogram(),
+            cache: latency_histogram(),
+            total: latency_histogram(),
+        }
+    }
+}
+
+/// Saturates at `u64::MAX` ns (about 584 years).
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+impl PhaseHistograms {
+    /// Records one access. `proxy` is `None` for engines without a router.
+    pub fn record(&mut self, proxy: Option<Duration>, cache: Duration, total: Duration) {
+        if let Some(proxy) = proxy {
+            self.proxy.saturating_record(nanos(proxy));
+        }
+        self.cache.saturating_record(nanos(cache));
+        self.total.saturating_record(nanos(total));
+    }
+
+    /// Adds `other`'s counts into `self`. Both use the same bounds, so this can't fail.
+    pub fn merge(&mut self, other: &Self) {
+        for (into, from) in [
+            (&mut self.proxy, &other.proxy),
+            (&mut self.cache, &other.cache),
+            (&mut self.total, &other.total),
+        ] {
+            let _ = into.add(from);
+        }
+    }
+}
 
 /// Measurement-phase counters, shared by every replay task.
 #[derive(Default)]
@@ -27,6 +122,7 @@ pub struct BenchMetrics {
 
     // Timing
     pub total_duration_us: AtomicU64,
+    pub latency: Striped<PhaseHistograms>,
 }
 
 impl BenchMetrics {
@@ -115,6 +211,75 @@ impl ClassReport {
     }
 }
 
+/// Latency percentiles of one phase, in microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Percentiles {
+    pub count: u64,
+    pub mean_us: f64,
+    pub p50_us: f64,
+    pub p90_us: f64,
+    pub p99_us: f64,
+    pub max_us: f64,
+}
+
+impl Percentiles {
+    /// Summarizes a nanosecond histogram, or `None` if it is empty.
+    // Nanosecond latencies are far below 2^52, so f64 is exact here.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn of(h: &Histogram<u64>) -> Option<Self> {
+        if h.is_empty() {
+            return None;
+        }
+        let us = |ns: u64| ns as f64 / 1_000.0;
+        Some(Self {
+            count: h.len(),
+            mean_us: h.mean() / 1_000.0,
+            p50_us: us(h.value_at_quantile(0.50)),
+            p90_us: us(h.value_at_quantile(0.90)),
+            p99_us: us(h.value_at_quantile(0.99)),
+            max_us: us(h.max()),
+        })
+    }
+}
+
+/// Per-phase latency: `T_proxy` (router), `T_cache` (engine) and the whole access.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct LatencyReport {
+    /// `None` for the baselines, which have no router.
+    pub proxy: Option<Percentiles>,
+    pub cache: Option<Percentiles>,
+    pub total: Option<Percentiles>,
+}
+
+impl LatencyReport {
+    /// Merges every stripe's histograms and summarizes them.
+    pub fn new(latency: &Striped<PhaseHistograms>) -> Self {
+        let mut merged = PhaseHistograms::default();
+        latency.for_each(|stripe| merged.merge(stripe));
+        Self {
+            proxy: Percentiles::of(&merged.proxy),
+            cache: Percentiles::of(&merged.cache),
+            total: Percentiles::of(&merged.total),
+        }
+    }
+
+    fn print(&self) {
+        println!("LATENCY (µs)            p50       p90       p99       max");
+        for (label, phase) in [
+            ("T_proxy (router)", self.proxy),
+            ("T_cache (engine)", self.cache),
+            ("Total access", self.total),
+        ] {
+            if let Some(p) = phase {
+                println!(
+                    "{label:<18} {:>9.2} {:>9.2} {:>9.2} {:>9.2}",
+                    p.p50_us, p.p90_us, p.p99_us, p.max_us
+                );
+            }
+        }
+    }
+}
+
 /// Everything a replay measured, as printed and as written to `--json-out`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
@@ -124,6 +289,7 @@ pub struct Report {
     pub human: ClassReport,
     pub bot: ClassReport,
     pub overall: ClassReport,
+    pub latency: LatencyReport,
 }
 
 impl Report {
@@ -155,6 +321,7 @@ impl Report {
                 load(&m.total_bytes),
                 load(&m.total_miss_bytes),
             ),
+            latency: LatencyReport::new(&m.latency),
         }
     }
 
@@ -211,6 +378,8 @@ impl Report {
         );
         println!("Bot Byte Hit Rate:      {:.2}%", pct(bot.byte_hit_rate));
         println!("(byte hit rates: capacity counts entries and no engine is size-aware)");
+        println!("--------------------------------------------------------");
+        self.latency.print();
         println!("========================================================");
     }
 }
@@ -255,5 +424,28 @@ mod tests {
         assert!((report.human.byte_hit_rate - 1.0).abs() < 1e-12);
         assert!(report.bot.byte_hit_rate.abs() < 1e-12);
         assert_eq!(report.bot.bytes, 1000);
+    }
+
+    #[test]
+    fn percentiles_come_from_the_merged_stripes() {
+        let latency = Striped::<PhaseHistograms>::default();
+        // 1..=100 µs spread across the stripes, with no router phase (like the baselines).
+        for (seq, us) in (1..=100_u64).enumerate() {
+            let d = Duration::from_micros(us);
+            latency.with(seq, |h| h.record(None, d, d));
+        }
+        let report = LatencyReport::new(&latency);
+        assert_eq!(report.proxy, None);
+        let total = report.total.unwrap();
+        assert_eq!(total.count, 100);
+        // 2 significant digits: within 1% of the exact value.
+        for (got, want) in [
+            (total.p50_us, 50.0),
+            (total.p99_us, 99.0),
+            (total.max_us, 100.0),
+        ] {
+            assert!((got / want - 1.0).abs() <= 0.01, "{got} vs {want}");
+        }
+        assert!((total.mean_us - 50.5).abs() < 0.6);
     }
 }

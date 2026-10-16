@@ -68,3 +68,5 @@ serde_json = "1.0.151"
 # Used only by src/bin/replay_bench.rs to build a standard, bot-unaware
 # sharded LRU cache as a comparison baseline against DTAC's own engine.
 lru = "0.12"
+# Used only by replay_bench to record T_proxy / T_cache latency percentiles.
+hdrhistogram = { version = "7", default-features = false }
