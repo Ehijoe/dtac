@@ -16,8 +16,12 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
-/// The number of independent mutex locks used for lock sharding.
+/// The maximum number of independently locked shards, and the number a cache of at
+/// least `NUM_SHARDS * MIN_ENTRIES_PER_SHARD` entries gets with [`Shards::Auto`](config::Shards::Auto).
 pub const NUM_SHARDS: usize = 256;
+
+/// The fewest entries per shard [`Shards::Auto`](config::Shards::Auto) allows before halving the shard count.
+pub const MIN_ENTRIES_PER_SHARD: usize = 64;
 
 /// Default number of random items selected during an eviction tournament
 /// ([`EngineConfig::n_samples`]).
@@ -64,6 +68,18 @@ impl Metadata {
         // Multiplying by a power of two is exact, like the original `score / (1 << dt)`.
         i32::try_from(half_lives).map_or(0.0, |n| self.score * 0.5_f32.powi(n))
     }
+}
+
+/// Which of `shard_count` shards `key` belongs to.
+///
+/// Public so that other sharded caches (the benchmark's baselines) split keys exactly
+/// like the engine does.
+// Only the hash's low bits matter for picking a shard.
+#[allow(clippy::cast_possible_truncation)]
+pub fn shard_of<K: Hash + ?Sized>(key: &K, shard_count: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % shard_count
 }
 
 /// Anything stored in a tournament-evicted dense vector that carries [`Metadata`].
@@ -230,7 +246,7 @@ pub struct DtacCacheEngine<K, P> {
 
 impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     /// Creates a new DTAC Engine with the specified total capacity.
-    /// The capacity is divided evenly among all shards.
+    /// The capacity is divided evenly among the shards ([`EngineConfig::shards`]).
     ///
     /// Uses the default [`EngineConfig`] and the system clock.
     pub fn new(total_capacity: usize) -> Self {
@@ -260,10 +276,11 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
         config: EngineConfig,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        let capacity_per_shard = (total_capacity / NUM_SHARDS).max(1);
+        let shard_count = config.shards.resolve(total_capacity).max(1);
+        let capacity_per_shard = (total_capacity / shard_count).max(1);
         let ghost_capacity_per_shard = capacity_per_shard * config.ghost_multiplier;
-        let mut shards = Vec::with_capacity(NUM_SHARDS);
-        for _ in 0..NUM_SHARDS {
+        let mut shards = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
             shards.push(Mutex::new(CacheShard::with_ghost_capacity(
                 capacity_per_shard,
                 ghost_capacity_per_shard,
@@ -284,8 +301,14 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     /// engine. Ghost-cache evictions are not reported.
     #[must_use]
     pub fn with_eviction_listener(mut self, listener: EvictionListener<K>) -> Self {
-        self.eviction_listener = Some(Listener(listener));
+        self.set_eviction_listener(listener);
         self
+    }
+
+    /// Like [`with_eviction_listener`](Self::with_eviction_listener), on an engine that
+    /// is already built. Replaces any previous listener.
+    pub fn set_eviction_listener(&mut self, listener: EvictionListener<K>) {
+        self.eviction_listener = Some(Listener(listener));
     }
 
     /// The configuration this engine runs with.
@@ -296,6 +319,11 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     /// The clock this engine reads time from.
     pub const fn clock(&self) -> &Arc<dyn Clock> {
         &self.clock
+    }
+
+    /// The number of independently locked shards.
+    pub const fn shard_count(&self) -> usize {
+        self.shards.len()
     }
 
     /// The maximum number of ghost-cache entries each shard holds.
@@ -330,12 +358,8 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     }
 
     /// Hashes the requested resource to determine its specific concurrency bucket.
-    // Only the hash's low bits matter for picking one of NUM_SHARDS shards.
-    #[allow(clippy::cast_possible_truncation)]
-    fn get_shard_id(resource: &K) -> usize {
-        let mut hasher = DefaultHasher::new();
-        resource.hash(&mut hasher);
-        (hasher.finish() as usize) % NUM_SHARDS
+    fn get_shard_id(&self, resource: &K) -> usize {
+        shard_of(resource, self.shards.len())
     }
 
     /// Returns `(total_entries, total_mapped_keys)` summed across all shards.
@@ -388,7 +412,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
     ///
     /// Intended for tests/diagnostics only.
     pub fn debug_score(&self, resource: &K) -> Option<f32> {
-        let meta = lock(&self.shards[Self::get_shard_id(resource)]).meta_of(resource)?;
+        let meta = lock(&self.shards[self.get_shard_id(resource)]).meta_of(resource)?;
         Some(meta.decayed_score(self.clock.now_millis(), &self.config))
     }
 
@@ -409,7 +433,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCacheEngine<K, P> {
         Fut: Future<Output = P>,
     {
         // Phase 1: Concurrency Management (Lock Sharding)
-        let shard_id = Self::get_shard_id(&requested_resource);
+        let shard_id = self.get_shard_id(&requested_resource);
 
         let action = {
             let mut shard = lock(&self.shards[shard_id]);
@@ -555,6 +579,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use config::Shards;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
@@ -655,11 +680,11 @@ mod tests {
         );
     }
 
-    /// `count` distinct keys that all hash to shard 0.
+    /// `count` distinct keys that all hash to shard 0 of `NUM_SHARDS`.
     fn keys_in_shard_zero(count: usize) -> Vec<String> {
         (0..)
             .map(|i| format!("k{i}"))
-            .filter(|k| DtacCacheEngine::<String, ()>::get_shard_id(k) == 0)
+            .filter(|k| shard_of(k, NUM_SHARDS) == 0)
             .take(count)
             .collect()
     }
@@ -671,6 +696,7 @@ mod tests {
         let clock = Arc::new(crate::clock::ManualClock::new(0));
         let config = EngineConfig {
             n_samples: 64,
+            shards: Shards::Fixed(NUM_SHARDS),
             ..Default::default()
         };
         let engine = DtacCacheEngine::<String, ()>::with_config(NUM_SHARDS, config, clock).unwrap();

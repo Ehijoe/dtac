@@ -1,6 +1,8 @@
 //! Tunable constants of the cache engine.
 
-use super::{GHOST_CAPACITY_MULTIPLIER, N_SAMPLES, PROMOTION_THRESHOLD};
+use super::{
+    GHOST_CAPACITY_MULTIPLIER, MIN_ENTRIES_PER_SHARD, N_SAMPLES, NUM_SHARDS, PROMOTION_THRESHOLD,
+};
 use crate::error::{DTACError, Result};
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +30,78 @@ pub struct EngineConfig {
     pub n_samples: usize,
     /// Ghost-cache capacity per shard, as a multiple of the main-cache capacity per shard.
     pub ghost_multiplier: usize,
+    /// How many independently locked shards the capacity is split across.
+    pub shards: Shards,
+}
+
+/// The number of lock shards a cache splits its capacity across.
+///
+/// In JSON, `"auto"` or a positive integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "ShardsRepr", into = "ShardsRepr")]
+pub enum Shards {
+    /// [`auto_shard_count`] of the capacity: [`NUM_SHARDS`] for large caches, fewer for
+    /// small ones so each shard keeps at least [`MIN_ENTRIES_PER_SHARD`] entries.
+    #[default]
+    Auto,
+    /// Exactly this many shards.
+    Fixed(usize),
+}
+
+impl Shards {
+    /// The shard count for a cache of `capacity` entries.
+    pub const fn resolve(self, capacity: usize) -> usize {
+        match self {
+            Self::Auto => auto_shard_count(capacity),
+            Self::Fixed(n) => n,
+        }
+    }
+}
+
+/// The largest power of two up to [`NUM_SHARDS`] that leaves at least
+/// [`MIN_ENTRIES_PER_SHARD`] entries per shard, and at least 1.
+///
+/// Tiny shards distort per-shard policies: a 5-sample tournament over 4 entries is an
+/// exhaustive search, and a 10% queue of 4 entries rounds to nothing. Capacities of
+/// `NUM_SHARDS * MIN_ENTRIES_PER_SHARD` (16 384) and up get all [`NUM_SHARDS`].
+pub const fn auto_shard_count(capacity: usize) -> usize {
+    let mut shards = NUM_SHARDS;
+    while shards > 1 && capacity / shards < MIN_ENTRIES_PER_SHARD {
+        shards /= 2;
+    }
+    shards
+}
+
+/// The JSON form of [`Shards`]: `"auto"` or a number.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ShardsRepr {
+    Fixed(usize),
+    Named(ShardsName),
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ShardsName {
+    Auto,
+}
+
+impl From<ShardsRepr> for Shards {
+    fn from(repr: ShardsRepr) -> Self {
+        match repr {
+            ShardsRepr::Fixed(n) => Self::Fixed(n),
+            ShardsRepr::Named(ShardsName::Auto) => Self::Auto,
+        }
+    }
+}
+
+impl From<Shards> for ShardsRepr {
+    fn from(shards: Shards) -> Self {
+        match shards {
+            Shards::Auto => Self::Named(ShardsName::Auto),
+            Shards::Fixed(n) => Self::Fixed(n),
+        }
+    }
 }
 
 impl Default for EngineConfig {
@@ -38,6 +112,7 @@ impl Default for EngineConfig {
             promotion_threshold: PROMOTION_THRESHOLD,
             n_samples: N_SAMPLES,
             ghost_multiplier: GHOST_CAPACITY_MULTIPLIER,
+            shards: Shards::Auto,
         }
     }
 }
@@ -61,6 +136,9 @@ impl EngineConfig {
         }
         if self.ghost_multiplier == 0 {
             return invalid("ghost_multiplier must be at least 1".to_string());
+        }
+        if self.shards == Shards::Fixed(0) {
+            return invalid("shards must be \"auto\" or at least 1".to_string());
         }
         Ok(())
     }
@@ -96,6 +174,10 @@ mod tests {
                 ghost_multiplier: 0,
                 ..Default::default()
             },
+            EngineConfig {
+                shards: Shards::Fixed(0),
+                ..Default::default()
+            },
         ] {
             assert!(bad.validate().is_err(), "{bad:?} should be rejected");
         }
@@ -113,6 +195,38 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn shards_are_auto_or_a_number_in_json() {
+        let auto: EngineConfig = serde_json::from_str(r#"{"shards": "auto"}"#).unwrap();
+        assert_eq!(auto.shards, Shards::Auto);
+        let fixed: EngineConfig = serde_json::from_str(r#"{"shards": 16}"#).unwrap();
+        assert_eq!(fixed.shards, Shards::Fixed(16));
+        assert!(serde_json::from_str::<EngineConfig>(r#"{"shards": "many"}"#).is_err());
+
+        let json = serde_json::to_value(EngineConfig::default()).unwrap();
+        assert_eq!(json["shards"], "auto");
+        let back: EngineConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back, EngineConfig::default());
+    }
+
+    #[test]
+    fn auto_shards_keep_at_least_64_entries_per_shard() {
+        assert_eq!(auto_shard_count(1_000), 8);
+        assert_eq!(auto_shard_count(5_000), 64);
+        assert_eq!(auto_shard_count(10_000), 128);
+        // The library's original 256 shards from 16 384 entries up.
+        assert_eq!(auto_shard_count(16_383), 128);
+        assert_eq!(auto_shard_count(16_384), NUM_SHARDS);
+        assert_eq!(auto_shard_count(1_000_000), NUM_SHARDS);
+        assert_eq!(auto_shard_count(10), 1);
+        assert_eq!(auto_shard_count(0), 1);
+        for capacity in [64, 100, 1_000, 5_000, 10_000, 20_000] {
+            let shards = auto_shard_count(capacity);
+            assert!(shards.is_power_of_two());
+            assert!(capacity / shards >= MIN_ENTRIES_PER_SHARD, "{capacity}");
+        }
     }
 
     #[test]

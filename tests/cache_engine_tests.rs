@@ -211,7 +211,8 @@ mod configured {
 async fn ghost_cache_stays_bounded_under_a_unique_key_scan() {
     let engine = DtacCacheEngine::<String, ()>::new(1024);
     let bound = engine.ghost_capacity_per_shard();
-    assert_eq!(bound, 4 * 4, "1024 / 256 shards * default multiplier 4");
+    assert_eq!(engine.shard_count(), 16, "auto: 64 entries per shard");
+    assert_eq!(bound, 64 * 4, "1024 / 16 shards * default multiplier 4");
 
     for i in 0..100_000 {
         engine.access(format!("scan-{i}"), 0.5, |_k| async {}).await;
@@ -221,7 +222,7 @@ async fn ghost_cache_stays_bounded_under_a_unique_key_scan() {
         assert_eq!(entries, mapped, "ghost index mismatch in shard {shard}");
         assert!(entries <= bound, "shard {shard} holds {entries} > {bound}");
     }
-    assert!(engine.ghost_len() <= bound * dtac::cache_engine::NUM_SHARDS);
+    assert!(engine.ghost_len() <= bound * engine.shard_count());
     let (total_entries, total_mapped) = engine.debug_integrity_counts();
     assert_eq!(total_entries, total_mapped);
 }
@@ -229,7 +230,7 @@ async fn ghost_cache_stays_bounded_under_a_unique_key_scan() {
 #[tokio::test]
 async fn eviction_listener_fires_once_per_main_cache_eviction_outside_the_lock() {
     use dtac::cache_engine::NUM_SHARDS;
-    use dtac::cache_engine::config::EngineConfig;
+    use dtac::cache_engine::config::{EngineConfig, Shards};
     use dtac::clock::ManualClock;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -249,7 +250,10 @@ async fn eviction_listener_fires_once_per_main_cache_eviction_outside_the_lock()
     let engine = Arc::new(
         DtacCacheEngine::<String, ()>::with_config(
             NUM_SHARDS,
-            EngineConfig::default(),
+            EngineConfig {
+                shards: Shards::Fixed(NUM_SHARDS),
+                ..Default::default()
+            },
             Arc::new(ManualClock::new(0)),
         )
         .unwrap()
@@ -272,6 +276,38 @@ async fn eviction_listener_fires_once_per_main_cache_eviction_outside_the_lock()
         "a key was reported twice"
     );
     assert!(!evicted.is_empty());
+}
+
+#[test]
+fn shard_count_follows_the_config() {
+    use dtac::cache_engine::NUM_SHARDS;
+    use dtac::cache_engine::config::{EngineConfig, Shards};
+    use dtac::clock::ManualClock;
+    use std::sync::Arc;
+
+    let build = |capacity, shards| {
+        let config = EngineConfig {
+            shards,
+            ..Default::default()
+        };
+        DtacCacheEngine::<String, ()>::with_config(capacity, config, Arc::new(ManualClock::new(0)))
+            .unwrap()
+    };
+    // Large caches keep the original 256 shards.
+    assert_eq!(build(16_384, Shards::Auto).shard_count(), NUM_SHARDS);
+    assert_eq!(build(1_000, Shards::Auto).shard_count(), 8);
+    assert_eq!(build(1_000, Shards::Fixed(3)).shard_count(), 3);
+    assert!(
+        DtacCacheEngine::<String, ()>::with_config(
+            1_000,
+            EngineConfig {
+                shards: Shards::Fixed(0),
+                ..Default::default()
+            },
+            Arc::new(ManualClock::new(0)),
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]

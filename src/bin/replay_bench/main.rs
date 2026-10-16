@@ -420,10 +420,13 @@ fn build_engine(
             }
             Engine::Dtac(Arc::new(builder.build()))
         }
-        Algorithm::Lru => Engine::Lru(Arc::new(
-            BaselineLruEngine::<String, bytes::Bytes>::new(args.capacity)
-                .with_eviction_listener(on_evict),
-        )),
+        Algorithm::Lru => {
+            let shards = build_engine_config(args)?.shards.resolve(args.capacity);
+            Engine::Lru(Arc::new(
+                BaselineLruEngine::<String, bytes::Bytes>::new(args.capacity, shards)
+                    .with_eviction_listener(on_evict),
+            ))
+        }
     })
 }
 

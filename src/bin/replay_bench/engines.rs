@@ -1,18 +1,17 @@
 //! Cache engines `replay_bench` can replay a log against.
 
-use dtac::cache_engine::{EvictionListener, NUM_SHARDS};
+use dtac::cache_engine::{EvictionListener, shard_of};
 use dtac::dtac_cache::DtacCache;
 use lru::LruCache;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// A standard, bot-unaware sharded LRU cache: the baseline that
 /// `--algorithm lru` benchmarks against DTAC's own engine. Shards the same
-/// way as `DtacCacheEngine` (same `NUM_SHARDS`, same capacity-per-shard
-/// math) so the comparison isolates eviction/admission policy rather than
-/// lock granularity or capacity partitioning. Bench-tool-only -- not part
+/// way as `DtacCacheEngine` (same shard count and key hashing, same
+/// capacity-per-shard math) so the comparison isolates eviction/admission
+/// policy rather than lock granularity or capacity partitioning. Bench-tool-only -- not part
 /// of the published `dtac` library.
 pub struct BaselineLruEngine<K, P> {
     shards: Vec<Mutex<LruCache<K, P>>>,
@@ -20,9 +19,11 @@ pub struct BaselineLruEngine<K, P> {
 }
 
 impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
-    pub fn new(total_capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(total_capacity / NUM_SHARDS).unwrap_or(NonZeroUsize::MIN);
-        let shards = (0..NUM_SHARDS)
+    /// An LRU cache of `total_capacity` entries split evenly across `shard_count` shards.
+    pub fn new(total_capacity: usize, shard_count: usize) -> Self {
+        let shard_count = shard_count.max(1);
+        let cap = NonZeroUsize::new(total_capacity / shard_count).unwrap_or(NonZeroUsize::MIN);
+        let shards = (0..shard_count)
             .map(|_| Mutex::new(LruCache::new(cap)))
             .collect();
         Self {
@@ -41,7 +42,7 @@ impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
 
     /// The keys currently cached, across all shards. Diagnostics only.
     pub fn resident_keys(&self) -> Vec<K> {
-        (0..NUM_SHARDS)
+        (0..self.shards.len())
             .flat_map(|id| {
                 self.shard(id)
                     .iter()
@@ -51,12 +52,8 @@ impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
             .collect()
     }
 
-    // Only the hash's low bits matter for picking one of NUM_SHARDS shards.
-    #[allow(clippy::cast_possible_truncation)]
-    fn get_shard_id(key: &K) -> usize {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        (hasher.finish() as usize) % NUM_SHARDS
+    fn get_shard_id(&self, key: &K) -> usize {
+        shard_of(key, self.shards.len())
     }
 
     /// Locks one shard, recovering the guard if a previous holder panicked, the same
@@ -72,7 +69,7 @@ impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
         F: FnOnce(&K) -> Fut,
         Fut: Future<Output = P>,
     {
-        let shard_id = Self::get_shard_id(&key);
+        let shard_id = self.get_shard_id(&key);
 
         // lru's get() already promotes to MRU
         let hit = self.shard(shard_id).get(&key).cloned();
@@ -114,12 +111,13 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dtac::cache_engine::NUM_SHARDS;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[tokio::test]
     async fn baseline_lru_hit_after_miss_does_not_refetch() {
-        let engine = BaselineLruEngine::<String, i32>::new(1);
+        let engine = BaselineLruEngine::<String, i32>::new(1, 1);
         let fetches = AtomicU64::new(0);
 
         let miss = engine
@@ -146,7 +144,7 @@ mod tests {
         let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
         for i in 0..5000 {
             let key = format!("k{i}");
-            let shard = BaselineLruEngine::<String, i32>::get_shard_id(&key);
+            let shard = shard_of(&key, NUM_SHARDS);
             by_shard.entry(shard).or_default().push(key);
         }
         by_shard
@@ -163,7 +161,7 @@ mod tests {
         let ledger = Arc::new(Ledger::default());
         ledger.start_measuring();
         let listener_ledger = ledger.clone();
-        let engine = BaselineLruEngine::<String, i32>::new(2 * NUM_SHARDS)
+        let engine = BaselineLruEngine::<String, i32>::new(2 * NUM_SHARDS, NUM_SHARDS)
             .with_eviction_listener(Arc::new(move |key: &String| listener_ledger.on_evict(key)));
         let (human_key, bot_key, later_key) = three_colliding_keys();
 
@@ -206,7 +204,7 @@ mod tests {
         let (key_a, key_b, key_c) = three_colliding_keys();
 
         // total_capacity = 2 * NUM_SHARDS -> capacity_per_shard == 2.
-        let engine = BaselineLruEngine::<String, i32>::new(2 * NUM_SHARDS);
+        let engine = BaselineLruEngine::<String, i32>::new(2 * NUM_SHARDS, NUM_SHARDS);
 
         let _ = engine.access(key_a.clone(), |_k| async { 1 }).await; // shard (MRU->LRU): [A]
         let _ = engine.access(key_b.clone(), |_k| async { 2 }).await; // shard: [B, A]
