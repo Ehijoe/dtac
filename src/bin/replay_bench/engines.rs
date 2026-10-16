@@ -1,6 +1,6 @@
 //! Cache engines `replay_bench` can replay a log against.
 
-use dtac::cache_engine::NUM_SHARDS;
+use dtac::cache_engine::{EvictionListener, NUM_SHARDS};
 use dtac::dtac_cache::DtacCache;
 use lru::LruCache;
 use std::collections::hash_map::DefaultHasher;
@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 /// of the published `dtac` library.
 pub struct BaselineLruEngine<K, P> {
     shards: Vec<Mutex<LruCache<K, P>>>,
+    eviction_listener: Option<EvictionListener<K>>,
 }
 
 impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
@@ -24,7 +25,30 @@ impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
         let shards = (0..NUM_SHARDS)
             .map(|_| Mutex::new(LruCache::new(cap)))
             .collect();
-        Self { shards }
+        Self {
+            shards,
+            eviction_listener: None,
+        }
+    }
+
+    /// Calls `listener` with every evicted key, after the shard lock is released, like
+    /// `DtacCacheEngine::with_eviction_listener`.
+    #[must_use]
+    pub fn with_eviction_listener(mut self, listener: EvictionListener<K>) -> Self {
+        self.eviction_listener = Some(listener);
+        self
+    }
+
+    /// The keys currently cached, across all shards. Diagnostics only.
+    pub fn resident_keys(&self) -> Vec<K> {
+        (0..NUM_SHARDS)
+            .flat_map(|id| {
+                self.shard(id)
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     // Only the hash's low bits matter for picking one of NUM_SHARDS shards.
@@ -59,8 +83,14 @@ impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
         // Release the lock before awaiting, matching DtacCacheEngine's
         // convention of never holding a shard lock across an await point.
         let payload = fetch_from_origin(&key).await;
-        // idempotent per key: no orphan-entry risk
-        self.shard(shard_id).put(key, payload.clone());
+        // `push` returns the LRU entry it evicted, or the old value if a concurrent miss
+        // inserted the same key first (idempotent per key: no orphan-entry risk).
+        let displaced = self.shard(shard_id).push(key.clone(), payload.clone());
+        if let (Some((evicted, _)), Some(listener)) = (displaced, &self.eviction_listener)
+            && evicted != key
+        {
+            listener(&evicted);
+        }
         payload
     }
 }
@@ -69,6 +99,16 @@ impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
 pub enum Engine {
     Dtac(Arc<DtacCache<String, bytes::Bytes>>),
     Lru(Arc<BaselineLruEngine<String, bytes::Bytes>>),
+}
+
+impl Engine {
+    /// The keys currently in the main cache. Locks every shard in turn.
+    pub fn resident_keys(&self) -> Vec<String> {
+        match self {
+            Self::Dtac(cache) => cache.engine().resident_keys(),
+            Self::Lru(lru) => lru.resident_keys(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +141,61 @@ mod tests {
         assert_eq!(fetches.load(Ordering::Relaxed), 1); // fetch not called again
     }
 
+    /// Three keys that hash to the same LRU shard.
+    fn three_colliding_keys() -> (String, String, String) {
+        let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
+        for i in 0..5000 {
+            let key = format!("k{i}");
+            let shard = BaselineLruEngine::<String, i32>::get_shard_id(&key);
+            by_shard.entry(shard).or_default().push(key);
+        }
+        by_shard
+            .values()
+            .find(|keys| keys.len() >= 3)
+            .map(|keys| (keys[0].clone(), keys[1].clone(), keys[2].clone()))
+            .expect("5000 candidate keys across 256 shards must collide 3-deep somewhere")
+    }
+
+    #[tokio::test]
+    async fn baseline_lru_reports_evictions_by_admitter() {
+        use crate::pollution::{Ledger, Origin, PollutionReport};
+
+        let ledger = Arc::new(Ledger::default());
+        ledger.start_measuring();
+        let listener_ledger = ledger.clone();
+        let engine = BaselineLruEngine::<String, i32>::new(2 * NUM_SHARDS)
+            .with_eviction_listener(Arc::new(move |key: &String| listener_ledger.on_evict(key)));
+        let (human_key, bot_key, later_key) = three_colliding_keys();
+
+        // Fetch as the bench does: the admitter is the label of the request that fetched.
+        let access = |key: &String, origin: Origin| {
+            let (ledger, engine, key) = (ledger.clone(), &engine, key.clone());
+            async move {
+                let fetched = key.clone();
+                engine
+                    .access(key, move |_k| {
+                        ledger.on_fetch(&fetched, origin, 1);
+                        async { 0 }
+                    })
+                    .await
+            }
+        };
+        access(&bot_key, Origin::Bot).await; // shard (MRU->LRU): [bot]
+        access(&human_key, Origin::Human).await; // shard: [human, bot]
+        access(&later_key, Origin::Human).await; // evicts bot -> [later, human]
+        access(&bot_key, Origin::Bot).await; // evicts human -> [bot, later]
+
+        // Re-requesting a resident key is a hit: no fetch, no eviction.
+        access(&later_key, Origin::Bot).await;
+
+        ledger.sample(&engine.resident_keys());
+        let report = PollutionReport::new(&ledger).unwrap();
+        assert_eq!(report.evictions_bot_admitted, 1);
+        assert_eq!(report.evictions_human_admitted, 1);
+        // Resident: `bot` (no human since admission) and `later` (human-admitted).
+        assert!((report.cpi_final - 0.5).abs() < 1e-12);
+    }
+
     #[tokio::test]
     async fn baseline_lru_evicts_least_recently_used_within_a_shard() {
         // DefaultHasher is fixed-seed, so shard assignment is deterministic;
@@ -108,17 +203,7 @@ mod tests {
         // so recency-ordered (not just capacity-1-swap) eviction is
         // observable, without depending on shard-count internals beyond
         // what BaselineLruEngine already exposes.
-        let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
-        for i in 0..5000 {
-            let key = format!("k{i}");
-            let shard = BaselineLruEngine::<String, i32>::get_shard_id(&key);
-            by_shard.entry(shard).or_default().push(key);
-        }
-        let (key_a, key_b, key_c) = by_shard
-            .values()
-            .find(|keys| keys.len() >= 3)
-            .map(|keys| (keys[0].clone(), keys[1].clone(), keys[2].clone()))
-            .expect("5000 candidate keys across 256 shards must collide 3-deep somewhere");
+        let (key_a, key_b, key_c) = three_colliding_keys();
 
         // total_capacity = 2 * NUM_SHARDS -> capacity_per_shard == 2.
         let engine = BaselineLruEngine::<String, i32>::new(2 * NUM_SHARDS);

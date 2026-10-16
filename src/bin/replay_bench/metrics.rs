@@ -2,6 +2,7 @@
 
 use crate::Algorithm;
 use crate::classifier::{ClassifierReport, Sample};
+use crate::pollution::{Ledger, PollutionReport};
 use hdrhistogram::Histogram;
 use prometheus::{Encoder, TextEncoder};
 use serde::Serialize;
@@ -127,6 +128,9 @@ pub struct BenchMetrics {
 
     // Router scores against ground truth (DTAC only)
     pub classifier: Striped<Vec<Sample>>,
+
+    // Admissions, evictions and CPI samples
+    pub ledger: Ledger,
 }
 
 impl BenchMetrics {
@@ -296,6 +300,8 @@ pub struct Report {
     pub latency: LatencyReport,
     /// `None` for the baselines, which don't score requests.
     pub classifier: Option<ClassifierReport>,
+    /// `None` if no CPI sample was taken.
+    pub pollution: Option<PollutionReport>,
 }
 
 impl Report {
@@ -334,6 +340,7 @@ impl Report {
                     .for_each(|stripe| samples.extend_from_slice(stripe));
                 ClassifierReport::new(&samples)
             },
+            pollution: PollutionReport::new(&m.ledger),
         }
     }
 
@@ -392,6 +399,10 @@ impl Report {
         println!("(byte hit rates: capacity counts entries and no engine is size-aware)");
         println!("--------------------------------------------------------");
         self.latency.print();
+        if let Some(pollution) = &self.pollution {
+            println!("--------------------------------------------------------");
+            pollution.print();
+        }
         if let Some(classifier) = &self.classifier {
             println!("--------------------------------------------------------");
             classifier.print();

@@ -5,6 +5,7 @@ mod classifier;
 mod common;
 mod engines;
 mod metrics;
+mod pollution;
 
 use clap::Parser;
 use classifier::{Label, Sample};
@@ -18,6 +19,7 @@ use dtac::types::RequestData;
 use engines::{BaselineLruEngine, Engine};
 use indicatif::{ProgressBar, ProgressStyle};
 use metrics::{BenchMetrics, Report, init_metrics, print_prometheus};
+use pollution::Origin;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -125,6 +127,10 @@ struct Args {
     /// Write every reported metric plus the run configuration to this JSON file.
     #[arg(long, value_name = "PATH")]
     json_out: Option<PathBuf>,
+
+    /// Sample the Cache Pollution Index every N measurement requests (and at the end).
+    #[arg(long, value_name = "N", default_value_t = 10_000)]
+    cpi_sample_every: usize,
 
     /// Hide the progress bar and the Prometheus dump, for scripted runs.
     #[arg(short, long)]
@@ -393,23 +399,29 @@ fn print_run_header(args: &Args, records: &[LogRecord]) {
 
 /// Builds the cache selected by `--algorithm`. For DTAC this prints the effective
 /// router and engine configs, and wires in `log_clock` when replaying on log time.
+/// Main-cache evictions are reported to `metrics`' ledger.
 fn build_engine(
     args: &Args,
     log_clock: Option<&Arc<ManualClock>>,
+    metrics: &Arc<BenchMetrics>,
 ) -> Result<Engine, Box<dyn std::error::Error>> {
+    let metrics = metrics.clone();
+    let on_evict = Arc::new(move |key: &String| metrics.ledger.on_evict(key));
     Ok(match args.algorithm {
         Algorithm::Dtac => {
             let mut builder = DtacCache::<String, bytes::Bytes>::builder(args.capacity)
                 .router(build_router(args)?)
-                .engine_config(build_engine_config(args)?)?;
+                .engine_config(build_engine_config(args)?)?
+                .eviction_listener(on_evict);
             if let Some(clock) = log_clock {
                 builder = builder.clock(clock.clone());
             }
             Engine::Dtac(Arc::new(builder.build()))
         }
-        Algorithm::Lru => Engine::Lru(Arc::new(BaselineLruEngine::<String, bytes::Bytes>::new(
-            args.capacity,
-        ))),
+        Algorithm::Lru => Engine::Lru(Arc::new(
+            BaselineLruEngine::<String, bytes::Bytes>::new(args.capacity)
+                .with_eviction_listener(on_evict),
+        )),
     })
 }
 
@@ -430,14 +442,18 @@ async fn replay_record(record: LogRecord, seq: usize, ctx: &ReplayCtx) {
     }
 
     let path = record.path.clone();
+    let key = record.path.clone();
+    let origin = if is_bot { Origin::Bot } else { Origin::Human };
     let label = Label::of(
         &record.traffic_type,
         record.visitor.as_deref(),
         record.bot_kind.as_deref(),
     );
 
-    // Closure triggered ONLY on a cache miss
-    let fetch_from_origin = |_key: &String| {
+    // Closure triggered ONLY on a cache miss. The ledger also tracks warm-up fetches, since
+    // warm-up admissions are still resident when measurement starts.
+    let fetch_from_origin = |fetched: &String| {
+        metrics.ledger.on_fetch(fetched, origin, size);
         if is_measurement {
             metrics.record_miss(is_bot, size);
         }
@@ -489,6 +505,9 @@ async fn replay_record(record: LogRecord, seq: usize, ctx: &ReplayCtx) {
             phases.map_or((None, total), |(router, engine)| (Some(router), engine));
         metrics.latency.with(seq, |h| h.record(proxy, cache, total));
     }
+    if !is_bot {
+        metrics.ledger.on_human_request(&key);
+    }
 }
 
 /// The progress bar for `len` records, hidden with `--quiet`.
@@ -522,6 +541,7 @@ async fn dispatch(
 ) -> Result<Duration, Box<dyn std::error::Error>> {
     let mut start_time = Instant::now();
     let mut measurement_started = false;
+    let mut measurement_dispatched = 0_usize;
     let bench_start = TokioInstant::now();
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let mut join_set = tokio::task::JoinSet::new();
@@ -537,7 +557,16 @@ async fn dispatch(
         if !measurement_started && record.phase == Phase::Measurement {
             measurement_started = true;
             start_time = Instant::now();
+            ctx.metrics.ledger.start_measuring();
             pb.println("Warm-up complete -- beginning measurement phase.");
+        }
+        if record.phase == Phase::Measurement {
+            if measurement_dispatched > 0
+                && measurement_dispatched.is_multiple_of(args.cpi_sample_every)
+            {
+                ctx.metrics.ledger.sample(&ctx.engine.resident_keys());
+            }
+            measurement_dispatched += 1;
         }
 
         // If --speed is set too low for the given --concurrency, this is
@@ -558,6 +587,7 @@ async fn dispatch(
 
     // Drain remaining in-flight work after the dispatch loop finishes issuing records.
     while join_set.join_next().await.is_some() {}
+    ctx.metrics.ledger.sample(&ctx.engine.resident_keys());
 
     pb.finish_with_message("Replay Complete");
     Ok(start_time.elapsed())
@@ -606,6 +636,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("--speed must be greater than 0.0 (got {})", args.speed);
         std::process::exit(1);
     }
+    if args.cpi_sample_every == 0 {
+        eprintln!("--cpi-sample-every must be at least 1");
+        std::process::exit(1);
+    }
     init_tracing_if_requested();
 
     // 1. Initialize Prometheus & OpenTelemetry Registry
@@ -623,10 +657,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .filter_map(|r| r.size_bytes)
         .fold(default_size, u64::max);
+    let metrics = Arc::new(BenchMetrics::default());
     let ctx = Arc::new(ReplayCtx {
-        engine: build_engine(&args, log_clock.as_ref())?,
+        engine: build_engine(&args, log_clock.as_ref(), &metrics)?,
         log_clock,
-        metrics: Arc::new(BenchMetrics::default()),
+        metrics,
         payload: bytes::Bytes::from(vec![0u8; usize::try_from(max_size)?]),
         default_size,
     });
