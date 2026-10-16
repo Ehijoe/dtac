@@ -2,6 +2,7 @@
 
 use crate::Algorithm;
 use prometheus::{Encoder, TextEncoder};
+use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -34,83 +35,122 @@ pub fn init_metrics() -> Result<prometheus::Registry, Box<dyn std::error::Error>
     Ok(registry)
 }
 
-// Request counts and microsecond totals are far below 2^52, so f64 is exact here.
+/// `part / whole`, or 0 when `whole` is 0.
+// Request counts and byte totals are far below 2^52, so f64 is exact here.
 #[allow(clippy::cast_precision_loss)]
-pub fn print_results(
-    m: &BenchMetrics,
-    total_time: Duration,
-    registry: &prometheus::Registry,
-    algorithm: Algorithm,
-) {
-    let total_reqs = m.total_requests.load(Ordering::Relaxed);
-    let total_misses = m.cache_miss_fetches.load(Ordering::Relaxed);
-    let total_hits = total_reqs.saturating_sub(total_misses);
-
-    let human_reqs = m.human_requests.load(Ordering::Relaxed);
-    let human_misses = m.human_misses.load(Ordering::Relaxed);
-    let human_hits = human_reqs.saturating_sub(human_misses);
-
-    let bot_reqs = m.bot_requests.load(Ordering::Relaxed);
-    let bot_misses = m.bot_misses.load(Ordering::Relaxed);
-    let bot_hits = bot_reqs.saturating_sub(bot_misses);
-
-    let total_us = m.total_duration_us.load(Ordering::Relaxed);
-    let avg_latency_us = if total_reqs > 0 {
-        total_us as f64 / total_reqs as f64
-    } else {
+pub fn ratio(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
         0.0
-    };
-    let rps = total_reqs as f64 / total_time.as_secs_f64();
-
-    let overall_hit_rate = if total_reqs > 0 {
-        (total_hits as f64 / total_reqs as f64) * 100.0
     } else {
-        0.0
-    };
-    let human_hit_rate = if human_reqs > 0 {
-        (human_hits as f64 / human_reqs as f64) * 100.0
-    } else {
-        0.0
-    };
-    let bot_hit_rate = if bot_reqs > 0 {
-        (bot_hits as f64 / bot_reqs as f64) * 100.0
-    } else {
-        0.0
-    };
+        part as f64 / whole as f64
+    }
+}
 
-    let report_label = match algorithm {
-        Algorithm::Dtac => "DTAC",
-        Algorithm::Lru => "STANDARD LRU (BASELINE)",
-    };
-    println!("\n========================================================");
-    println!("          {report_label} DIRECT BENCHMARK REPORT          ");
-    println!("          (post-warm-up, steady-state measurement)        ");
-    println!("========================================================");
-    println!("Elapsed Time:           {total_time:.3?}");
-    println!("Throughput:             {rps:.2} ops/sec");
-    println!("Average Access Time:    {avg_latency_us:.3} µs");
-    println!("--------------------------------------------------------");
-    println!("PRIMARY METRIC");
-    println!("Human Requests:         {human_reqs}");
-    println!(
-        "Human Cache Hit Rate:   {human_hit_rate:.2}% ({human_hits} hits / {human_misses} misses)"
-    );
-    println!("--------------------------------------------------------");
-    println!("SECONDARY METRIC");
-    println!("Total Requests:         {total_reqs}");
-    println!("Overall Cache Hit Rate: {total_hits} ({overall_hit_rate:.2}%)");
-    println!(
-        "Total Cache Misses:     {} ({:.2}%)",
-        total_misses,
-        100.0 - overall_hit_rate
-    );
-    println!("--------------------------------------------------------");
-    println!("FOR REFERENCE ONLY -- not an optimization target");
-    println!("Bot Requests:           {bot_reqs}");
-    println!("Bot Cache Hit Rate:     {bot_hit_rate:.2}% ({bot_hits} hits / {bot_misses} misses)");
-    println!("========================================================");
+/// Request outcomes for one traffic class (human, bot or all).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ClassReport {
+    pub requests: u64,
+    pub hits: u64,
+    pub misses: u64,
+    /// `hits / requests`, in `[0, 1]`.
+    pub hit_rate: f64,
+}
 
-    // Print internal Prometheus metrics gathered by DTAC / OpenTelemetry
+impl ClassReport {
+    pub fn new(requests: u64, misses: u64) -> Self {
+        let hits = requests.saturating_sub(misses);
+        Self {
+            requests,
+            hits,
+            misses,
+            hit_rate: ratio(hits, requests),
+        }
+    }
+}
+
+/// Everything a replay measured, as printed and as written to `--json-out`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Report {
+    pub elapsed_s: f64,
+    pub throughput_rps: f64,
+    pub avg_access_time_us: f64,
+    pub human: ClassReport,
+    pub bot: ClassReport,
+    pub overall: ClassReport,
+}
+
+impl Report {
+    /// Summarizes the measurement-phase counters.
+    // Microsecond totals are far below 2^52, so f64 is exact here.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn new(m: &BenchMetrics, elapsed: Duration) -> Self {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let total_requests = load(&m.total_requests);
+        Self {
+            elapsed_s: elapsed.as_secs_f64(),
+            throughput_rps: total_requests as f64 / elapsed.as_secs_f64(),
+            avg_access_time_us: ratio(load(&m.total_duration_us), total_requests),
+            human: ClassReport::new(load(&m.human_requests), load(&m.human_misses)),
+            bot: ClassReport::new(load(&m.bot_requests), load(&m.bot_misses)),
+            overall: ClassReport::new(total_requests, load(&m.cache_miss_fetches)),
+        }
+    }
+
+    /// Prints the human-readable report.
+    pub fn print(&self, algorithm: Algorithm) {
+        let pct = |rate: f64| rate * 100.0;
+        let report_label = match algorithm {
+            Algorithm::Dtac => "DTAC",
+            Algorithm::Lru => "STANDARD LRU (BASELINE)",
+        };
+        let (human, bot, overall) = (&self.human, &self.bot, &self.overall);
+        println!("\n========================================================");
+        println!("          {report_label} DIRECT BENCHMARK REPORT          ");
+        println!("          (post-warm-up, steady-state measurement)        ");
+        println!("========================================================");
+        println!(
+            "Elapsed Time:           {:.3?}",
+            Duration::from_secs_f64(self.elapsed_s)
+        );
+        println!("Throughput:             {:.2} ops/sec", self.throughput_rps);
+        println!("Average Access Time:    {:.3} µs", self.avg_access_time_us);
+        println!("--------------------------------------------------------");
+        println!("PRIMARY METRIC");
+        println!("Human Requests:         {}", human.requests);
+        println!(
+            "Human Cache Hit Rate:   {:.2}% ({} hits / {} misses)",
+            pct(human.hit_rate),
+            human.hits,
+            human.misses
+        );
+        println!("--------------------------------------------------------");
+        println!("SECONDARY METRIC");
+        println!("Total Requests:         {}", overall.requests);
+        println!(
+            "Overall Cache Hit Rate: {} ({:.2}%)",
+            overall.hits,
+            pct(overall.hit_rate)
+        );
+        println!(
+            "Total Cache Misses:     {} ({:.2}%)",
+            overall.misses,
+            100.0 - pct(overall.hit_rate)
+        );
+        println!("--------------------------------------------------------");
+        println!("FOR REFERENCE ONLY -- not an optimization target");
+        println!("Bot Requests:           {}", bot.requests);
+        println!(
+            "Bot Cache Hit Rate:     {:.2}% ({} hits / {} misses)",
+            pct(bot.hit_rate),
+            bot.hits,
+            bot.misses
+        );
+        println!("========================================================");
+    }
+}
+
+/// Prints the OpenTelemetry metrics the library recorded, as Prometheus text.
+pub fn print_prometheus(registry: &prometheus::Registry) {
     println!("\n--- Raw Prometheus Metrics Registry Output ---");
     let encoder = TextEncoder::new();
     let mut buffer = vec![];
@@ -119,5 +159,18 @@ pub fn print_results(
         && let Ok(text) = String::from_utf8(buffer)
     {
         println!("{text}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn class_report_derives_hits_and_rate() {
+        let r = ClassReport::new(10, 4);
+        assert_eq!((r.hits, r.misses), (6, 4));
+        assert!((r.hit_rate - 0.6).abs() < 1e-12);
+        assert!(ClassReport::new(0, 0).hit_rate.abs() < f64::EPSILON);
     }
 }

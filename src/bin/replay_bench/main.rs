@@ -15,8 +15,8 @@ use dtac::heuristic_router::config::RouterConfig;
 use dtac::types::RequestData;
 use engines::{BaselineLruEngine, Engine};
 use indicatif::{ProgressBar, ProgressStyle};
-use metrics::{BenchMetrics, init_metrics, print_results};
-use serde::Deserialize;
+use metrics::{BenchMetrics, Report, init_metrics, print_prometheus};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -29,8 +29,9 @@ use tokio::sync::Semaphore;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
 /// Which caching algorithm `replay_bench` drives the replayed log against.
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-enum Algorithm {
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Algorithm {
     /// DTAC's bot-aware randomized-eviction engine (the engine under test).
     Dtac,
     /// A standard, bot-unaware sharded LRU cache -- the baseline a
@@ -39,7 +40,8 @@ enum Algorithm {
 }
 
 /// Where the cache engine and router read time from during a replay.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum ClockMode {
     /// Simulated time taken from each record's logged timestamp, so `--speed` only
     /// changes how long the replay takes, not what it measures.
@@ -116,6 +118,84 @@ struct Args {
     /// `--router-config`; 0.5 reproduces the original zero prior.
     #[arg(long, value_name = "P")]
     prior_bot_rate: Option<f64>,
+
+    /// Write every reported metric plus the run configuration to this JSON file.
+    #[arg(long, value_name = "PATH")]
+    json_out: Option<PathBuf>,
+
+    /// Hide the progress bar and the Prometheus dump, for scripted runs.
+    #[arg(short, long)]
+    quiet: bool,
+}
+
+/// The run configuration written to `--json-out` next to the results.
+#[derive(Serialize)]
+struct RunInfo<'a> {
+    file: &'a Path,
+    algorithm: Algorithm,
+    capacity: usize,
+    concurrency: usize,
+    payload_size: usize,
+    speed: f64,
+    clock: ClockMode,
+    asn_db: &'a [PathBuf],
+    /// Effective router config; `None` for engines without a router.
+    router_config: Option<RouterConfig>,
+    /// Effective engine config; `None` for the baselines.
+    engine_config: Option<EngineConfig>,
+    /// The log's `.meta.json` sidecar (seed, ratio, generator arguments), if present.
+    log_meta: Option<serde_json::Value>,
+    /// The bench's git commit, with `-dirty` if the tree had changes.
+    git_commit: Option<String>,
+}
+
+/// The whole `--json-out` document.
+#[derive(Serialize)]
+struct JsonOut<'a> {
+    run: RunInfo<'a>,
+    results: &'a Report,
+}
+
+/// `traffic.ndjson` -> `traffic.meta.json`, the generator's sidecar.
+fn meta_path(log: &Path) -> PathBuf {
+    log.with_extension("meta.json")
+}
+
+/// Reads the log's `.meta.json` sidecar, or `None` if it doesn't exist (older logs).
+fn load_log_meta(log: &Path) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let path = meta_path(log);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_reader(BufReader::new(File::open(
+        path,
+    )?))?))
+}
+
+/// The commit the bench was built from: `DTAC_GIT_COMMIT` at build time if set, else
+/// `git rev-parse HEAD` in the source tree at runtime.
+fn git_commit() -> Option<String> {
+    if let Some(commit) = option_env!("DTAC_GIT_COMMIT") {
+        return Some(commit.to_string());
+    }
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(env!("CARGO_MANIFEST_DIR"))
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let commit = git(&["rev-parse", "HEAD"])?;
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
+        .is_some_and(|status| !status.is_empty());
+    Some(if dirty {
+        format!("{commit}-dirty")
+    } else {
+        commit
+    })
 }
 
 /// Builds the router from `--router-config`, `--prior-bot-rate` and the ASN flags.
@@ -394,7 +474,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(BenchMetrics::default());
     let default_payload = bytes::Bytes::from(vec![0u8; args.payload_size]);
 
-    let pb = ProgressBar::new(total_records as u64);
+    let pb = if args.quiet {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new(total_records as u64)
+    };
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
@@ -453,7 +537,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_wall_time = start_time.elapsed();
 
     // 5. Gather and compute final statistics
-    print_results(&metrics, total_wall_time, &registry, args.algorithm);
+    let report = Report::new(&metrics, total_wall_time);
+    report.print(args.algorithm);
+    if !args.quiet {
+        print_prometheus(&registry);
+    }
     if let Engine::Dtac(cache) = &engine {
         // Metadata overhead: the ghost cache holds keys and scores but no payloads.
         println!(
@@ -462,6 +550,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache.engine().ghost_len(),
             cache.engine().ghost_capacity_per_shard()
         );
+    }
+
+    if let Some(path) = &args.json_out {
+        let (router_config, engine_config) = match &engine {
+            Engine::Dtac(cache) => (
+                Some(*cache.router().config()),
+                Some(*cache.engine().config()),
+            ),
+            Engine::Lru(_) => (None, None),
+        };
+        let out = JsonOut {
+            run: RunInfo {
+                file: &args.file,
+                algorithm: args.algorithm,
+                capacity: args.capacity,
+                concurrency: args.concurrency,
+                payload_size: args.payload_size,
+                speed: args.speed,
+                clock: args.clock,
+                asn_db: &args.asn.asn_db,
+                router_config,
+                engine_config,
+                log_meta: load_log_meta(&args.file)?,
+                git_commit: git_commit(),
+            },
+            results: &report,
+        };
+        serde_json::to_writer_pretty(std::io::BufWriter::new(File::create(path)?), &out)?;
+        println!("Wrote {}", path.display());
     }
 
     Ok(())
@@ -511,6 +628,14 @@ mod tests {
             Phase::Measurement
         );
         Ok(())
+    }
+
+    #[test]
+    fn meta_path_replaces_the_ndjson_extension() {
+        assert_eq!(
+            meta_path(Path::new("logs/traffic_mixed_10pct_bot.ndjson")),
+            PathBuf::from("logs/traffic_mixed_10pct_bot.meta.json")
+        );
     }
 
     #[tokio::test]
