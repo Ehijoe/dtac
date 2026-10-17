@@ -642,7 +642,8 @@ ROUTER_GRID = [
     ("shy_page_threshold", {"shy_page_threshold": [3, 5, 8, 12]}),
 ]
 ENGINE_GRID = [
-    ("decay_half_life_ms", {"decay_half_life_ms": [1_000, 10_000, 60_000, 300_000, 1_800_000]}),
+    ("decay_half_life_ms", {"decay_half_life_ms": [1_000, 10_000, 60_000, 300_000, 1_800_000,
+                                                   3_600_000, 14_400_000]}),
     ("promotion_threshold", {"promotion_threshold": [0.5, 1.0, 1.5, 2.0, 3.0]}),
     ("ghost_multiplier", {"ghost_multiplier": [1, 2, 4, 8]}),
     ("n_samples", {"n_samples": [3, 5, 8, 14]}),
@@ -733,7 +734,11 @@ class Tuner:
 
 
 def _short(router: dict, engine: dict) -> str:
-    return _canonical({**router, **engine})[:80] + "..."
+    keys = ["prior_bot_rate", "w_hdr", "w_fav", "w_asn", "velocity_tick_ms", "burst_threshold",
+            "shy_page_threshold", "decay_half_life_ms", "promotion_threshold", "ghost_multiplier",
+            "n_samples"]
+    merged = {**router, **engine}
+    return " ".join(f"{k}={_fmt(merged[k])}" for k in keys if k in merged)
 
 
 def _refined(values, chosen):
@@ -983,8 +988,10 @@ def cmd_tune(args) -> None:
     router, engine = start
     print(f"Starting from the library defaults:\n  router {router}\n  engine {engine}", flush=True)
     print("Router stage...", flush=True)
+    # Two coarse passes per stage: the parameters interact (the prior only pays off once
+    # the weights saturate bots; the half-life decides which thresholds work).
     router, _, router_sweeps = coordinate_descent(tuner, ROUTER_GRID, router, engine, "router",
-                                                  ROUTER_TOLERANCE, passes=1)
+                                                  ROUTER_TOLERANCE, passes=2)
     print(f"Router: {router}\nEngine stage...", flush=True)
     _, engine, engine_sweeps = coordinate_descent(tuner, ENGINE_GRID, router, engine, "engine",
                                                   ENGINE_TOLERANCE, passes=2)
