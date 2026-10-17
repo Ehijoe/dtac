@@ -544,7 +544,11 @@ async fn replay_record<E: BenchEngine>(record: LogRecord, seq: usize, ctx: &Repl
     let total = req_start.elapsed();
     if is_measurement {
         if let Some(bot_prob) = outcome.bot_prob {
-            let sample = Sample { bot_prob, label };
+            let sample = Sample {
+                bot_prob,
+                label,
+                evidence: outcome.evidence,
+            };
             metrics.classifier.with(seq, |samples| samples.push(sample));
         }
         metrics.total_duration_us.fetch_add(

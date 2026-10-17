@@ -4,6 +4,7 @@ use bytes::Bytes;
 use dtac::cache_engine::config::EngineConfig;
 use dtac::cache_engine::{DtacCacheEngine, EvictionListener, shard_of};
 use dtac::dtac_cache::DtacCache;
+use dtac::heuristic_router::Evidence;
 use dtac::heuristic_router::config::RouterConfig;
 use dtac::types::RequestData;
 use lru::LruCache;
@@ -19,6 +20,8 @@ pub struct Outcome {
     /// The router's bot probability, for the classifier report. `None` for engines
     /// that don't score requests.
     pub bot_prob: Option<f32>,
+    /// Which of the router's heuristics fired; all false without a router.
+    pub evidence: Evidence,
     /// `(T_proxy, T_cache)` for engines that time their own phases. For the others the
     /// bench counts the whole access as `T_cache`.
     pub phases: Option<(Duration, Duration)>,
@@ -87,6 +90,7 @@ impl BenchEngine for DtacEngine {
         let (_, stats) = self.0.access_with_stats(key, request(), fetch).await;
         Outcome {
             bot_prob: Some(stats.bot_prob),
+            evidence: stats.evidence,
             phases: Some((stats.router_time, stats.engine_time)),
         }
     }

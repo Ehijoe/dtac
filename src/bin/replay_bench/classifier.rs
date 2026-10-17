@@ -2,6 +2,7 @@
 //! independently of what the cache did with the scores.
 
 use crate::metrics::ratio;
+use dtac::heuristic_router::Evidence;
 use serde::Serialize;
 
 /// Threshold above which a request counts as flagged for precision/recall/FPR.
@@ -75,6 +76,64 @@ impl Label {
 pub struct Sample {
     pub bot_prob: f32,
     pub label: Label,
+    /// Which heuristics fired.
+    pub evidence: Evidence,
+}
+
+/// How often one heuristic fires on each class.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HeuristicReport {
+    pub name: &'static str,
+    pub fired_human: u64,
+    pub fired_bot: u64,
+    /// `P(fired | human)`.
+    pub rate_human: f64,
+    /// `P(fired | bot)`.
+    pub rate_bot: f64,
+    /// Empirical log-likelihood ratio `ln(P(fired | bot) / P(fired | human))`, with 0.5
+    /// added to each count (Haldane's correction) so it stays finite when a heuristic
+    /// never fires on one class. This is the quantity the thesis says the weights are.
+    pub llr: f64,
+}
+
+/// Reads one heuristic's flag out of an [`Evidence`].
+type Fired = fn(&Evidence) -> bool;
+
+/// The heuristics in [`Evidence`], by name.
+const HEURISTICS: [(&str, Fired); 4] = [
+    ("velocity", |e| e.velocity),
+    ("datacenter_asn", |e| e.datacenter_asn),
+    ("missing_assets", |e| e.missing_assets),
+    ("missing_accept_language", |e| e.missing_accept_language),
+];
+
+/// Firing rates and empirical LLRs of every heuristic.
+// Counts are far below 2^52, so f64 is exact here.
+#[allow(clippy::cast_precision_loss)]
+fn heuristic_reports(samples: &[Sample]) -> Vec<HeuristicReport> {
+    let bots = samples.iter().filter(|s| s.label.is_bot()).count() as u64;
+    let humans = samples.len() as u64 - bots;
+    HEURISTICS
+        .iter()
+        .map(|&(name, fired)| {
+            let count = |bot: bool| {
+                samples
+                    .iter()
+                    .filter(|s| s.label.is_bot() == bot && fired(&s.evidence))
+                    .count() as u64
+            };
+            let (fired_human, fired_bot) = (count(false), count(true));
+            let smoothed = |k: u64, n: u64| (k as f64 + 0.5) / (n as f64 + 1.0);
+            HeuristicReport {
+                name,
+                fired_human,
+                fired_bot,
+                rate_human: ratio(fired_human, humans),
+                rate_bot: ratio(fired_bot, bots),
+                llr: (smoothed(fired_bot, bots) / smoothed(fired_human, humans)).ln(),
+            }
+        })
+        .collect()
 }
 
 /// Score distribution and flag rate for one [`Label`].
@@ -119,6 +178,8 @@ pub struct ClassifierReport {
     pub fpr_returning_visitors: Option<f64>,
     pub by_label: Vec<LabelReport>,
     pub histogram: ScoreHistogram,
+    /// How often each heuristic fires on humans and bots.
+    pub heuristics: Vec<HeuristicReport>,
 }
 
 /// Area under the ROC curve via the Mann-Whitney U statistic: sorts by score and
@@ -216,6 +277,7 @@ impl ClassifierReport {
             fpr_returning_visitors: flagged_rate_of(Label::HumanReturning),
             by_label,
             histogram: histogram(samples),
+            heuristics: heuristic_reports(samples),
         })
     }
 
@@ -242,6 +304,16 @@ impl ClassifierReport {
                 "Human FPR by visitor:   new {:.2}%, returning {:.2}%",
                 pct(new),
                 pct(returning)
+            );
+        }
+        println!("Heuristic fires on:         human     bot  empirical LLR");
+        for h in &self.heuristics {
+            println!(
+                "  {:<24}{:>6.2}%  {:>6.2}%  {:>+8.2}",
+                h.name,
+                pct(h.rate_human),
+                pct(h.rate_bot),
+                h.llr
             );
         }
     }
@@ -277,7 +349,45 @@ mod tests {
     use super::*;
 
     fn sample(bot_prob: f32, label: Label) -> Sample {
-        Sample { bot_prob, label }
+        Sample {
+            bot_prob,
+            label,
+            evidence: Evidence::default(),
+        }
+    }
+
+    #[test]
+    fn heuristic_llr_compares_firing_rates() {
+        let header = Evidence {
+            missing_accept_language: true,
+            ..Evidence::default()
+        };
+        let with = |label, evidence| Sample {
+            evidence,
+            ..sample(0.5, label)
+        };
+        // 3 of 4 bots and 1 of 4 humans miss the header.
+        let s = [
+            with(Label::Bot, header),
+            with(Label::Bot, header),
+            with(Label::Bot, header),
+            with(Label::Bot, Evidence::default()),
+            with(Label::Human, header),
+            with(Label::Human, Evidence::default()),
+            with(Label::Human, Evidence::default()),
+            with(Label::Human, Evidence::default()),
+        ];
+        let reports = heuristic_reports(&s);
+        let h = reports
+            .iter()
+            .find(|h| h.name == "missing_accept_language")
+            .unwrap();
+        assert_eq!((h.fired_bot, h.fired_human), (3, 1));
+        assert!((h.rate_bot - 0.75).abs() < 1e-12);
+        assert!((h.llr - (3.5_f64 / 1.5).ln()).abs() < 1e-12);
+        // A heuristic that never fires has an LLR of 0, not NaN.
+        let asn = reports.iter().find(|h| h.name == "datacenter_asn").unwrap();
+        assert!(asn.llr.abs() < 1e-12);
     }
 
     #[test]
