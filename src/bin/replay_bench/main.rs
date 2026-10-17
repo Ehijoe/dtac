@@ -6,6 +6,7 @@ mod common;
 mod engines;
 mod metrics;
 mod pollution;
+mod s3fifo;
 mod sieve;
 
 use clap::Parser;
@@ -25,6 +26,7 @@ use metrics::{
     BenchMetrics, MemoryReport, Report, init_metrics, print_prometheus, proc_status_bytes,
 };
 use pollution::Origin;
+use s3fifo::S3FifoShard;
 use serde::{Deserialize, Serialize};
 use sieve::SieveShard;
 use std::collections::HashMap;
@@ -52,6 +54,8 @@ pub enum Algorithm {
     Lru,
     /// SIEVE (NSDI '24): FIFO with a visited bit and a moving eviction hand.
     Sieve,
+    /// S3-FIFO (SOSP '23): small, main and ghost FIFO queues with 2-bit frequencies.
+    S3fifo,
 }
 
 /// Where the cache engine and router read time from during a replay.
@@ -789,6 +793,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Algorithm::Sieve => {
             let engine = Sharded::<SieveShard<_, _>>::new(args.capacity, shard_count(&args)?);
+            run(engine, &args, records, log_clock, &registry).await
+        }
+        Algorithm::S3fifo => {
+            let engine = Sharded::<S3FifoShard<_, _>>::new(args.capacity, shard_count(&args)?);
             run(engine, &args, records, log_clock, &registry).await
         }
     }

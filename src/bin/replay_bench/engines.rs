@@ -599,6 +599,11 @@ mod tests {
         check_sharded_policy::<crate::sieve::SieveShard<String, Bytes>>().await;
     }
 
+    #[tokio::test]
+    async fn s3fifo_keeps_capacity_and_reports_every_eviction() {
+        check_sharded_policy::<crate::s3fifo::S3FifoShard<String, Bytes>>().await;
+    }
+
     /// Three keys that hash to the same LRU shard.
     fn three_colliding_keys() -> (String, String, String) {
         let mut by_shard: HashMap<usize, Vec<String>> = HashMap::new();
