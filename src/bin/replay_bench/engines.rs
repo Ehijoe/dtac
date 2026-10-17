@@ -118,6 +118,126 @@ impl BenchEngine for DtacEngine {
     }
 }
 
+/// One shard of a baseline cache policy. [`Sharded`] owns the locking, the shard
+/// choice and the eviction notifications, so a policy is plain single-threaded code.
+pub trait ShardPolicy<K, P>: Send + 'static {
+    /// The `--algorithm` value.
+    const NAME: &'static str;
+
+    /// An empty shard holding at most `capacity` entries.
+    fn with_capacity(capacity: usize) -> Self;
+
+    /// The payload of `key` on a hit, updating the policy's hit bookkeeping.
+    fn get(&mut self, key: &K) -> Option<P>;
+
+    /// Inserts `key` after a miss, pushing every key it evicts onto `evicted`. A no-op
+    /// if a concurrent miss already inserted it.
+    fn insert(&mut self, key: K, payload: P, evicted: &mut Vec<K>);
+
+    /// The keys currently cached.
+    fn keys(&self) -> Vec<K>;
+
+    /// The number of keys currently cached.
+    fn len(&self) -> usize;
+
+    /// Metadata-only entries kept for evicted keys, if the policy keeps any.
+    fn ghost_len(&self) -> Option<usize> {
+        None
+    }
+
+    /// The bound on [`ghost_len`](Self::ghost_len), if the policy keeps a ghost.
+    fn ghost_capacity(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// A baseline policy split across shards exactly like `DtacCacheEngine`: keys go to
+/// shards by [`shard_of`] and every shard gets `capacity / shards` entries.
+pub struct Sharded<S> {
+    shards: Vec<Mutex<S>>,
+    eviction_listener: Option<EvictionListener<String>>,
+}
+
+impl<S: ShardPolicy<String, Bytes>> Sharded<S> {
+    pub fn new(total_capacity: usize, shard_count: usize) -> Self {
+        let shard_count = shard_count.max(1);
+        let per_shard = (total_capacity / shard_count).max(1);
+        Self {
+            shards: (0..shard_count)
+                .map(|_| Mutex::new(S::with_capacity(per_shard)))
+                .collect(),
+            eviction_listener: None,
+        }
+    }
+
+    fn shard(&self, id: usize) -> MutexGuard<'_, S> {
+        self.shards[id]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Looks `key` up and fetches it on a miss. The lock is released while fetching,
+    /// and evicted keys are reported after it is released again.
+    pub async fn access<F, Fut>(&self, key: String, fetch: F) -> Bytes
+    where
+        F: FnOnce(&String) -> Fut,
+        Fut: Future<Output = Bytes>,
+    {
+        let id = shard_of(&key, self.shards.len());
+        let hit = self.shard(id).get(&key);
+        if let Some(payload) = hit {
+            return payload;
+        }
+        let payload = fetch(&key).await;
+        let mut evicted = Vec::new();
+        self.shard(id).insert(key, payload.clone(), &mut evicted);
+        if let Some(listener) = &self.eviction_listener {
+            for key in &evicted {
+                listener(key);
+            }
+        }
+        payload
+    }
+}
+
+impl<S: ShardPolicy<String, Bytes> + Send> BenchEngine for Sharded<S> {
+    fn name(&self) -> &'static str {
+        S::NAME
+    }
+
+    async fn access<R, F, Fut>(&self, key: String, _request: R, fetch: F) -> Outcome
+    where
+        R: FnOnce() -> RequestData + Send,
+        F: FnOnce(&String) -> Fut + Send,
+        Fut: Future<Output = Bytes> + Send,
+    {
+        Self::access(self, key, fetch).await;
+        Outcome::default()
+    }
+
+    fn resident_keys(&self) -> Vec<String> {
+        (0..self.shards.len())
+            .flat_map(|id| self.shard(id).keys())
+            .collect()
+    }
+
+    fn set_eviction_listener(&mut self, listener: EvictionListener<String>) {
+        self.eviction_listener = Some(listener);
+    }
+
+    fn structure(&self) -> Structure {
+        let shards = self.shards.len();
+        let ghosts: Vec<Option<usize>> = (0..shards).map(|id| self.shard(id).ghost_len()).collect();
+        Structure {
+            shards,
+            main_entries: (0..shards).map(|id| self.shard(id).len()).sum(),
+            ghost_entries: ghosts.iter().copied().sum(),
+            ghost_capacity_per_shard: self.shard(0).ghost_capacity(),
+            tracked_ips: None,
+        }
+    }
+}
+
 /// The ablation: DTAC's engine (ghost admission and the decayed-score tournament) with
 /// every request given the same constant bot probability instead of a router score.
 ///
@@ -426,6 +546,57 @@ mod tests {
             "no router, so no score or phases"
         );
         assert_eq!(fetches.load(Ordering::Relaxed), 3);
+    }
+
+    /// Replays 100k skewed random requests through a sharded baseline and checks the
+    /// resident set never exceeds the capacity and every eviction was reported once.
+    async fn check_sharded_policy<S: ShardPolicy<String, Bytes>>() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        let evicted: Arc<Mutex<Vec<String>>> = Arc::default();
+        let mut engine = Sharded::<S>::new(1_000, 8);
+        let log = evicted.clone();
+        BenchEngine::set_eviction_listener(
+            &mut engine,
+            Arc::new(move |key: &String| log.lock().unwrap().push(key.clone())),
+        );
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut fetched = 0_usize;
+        for i in 0..100_000 {
+            let key = format!(
+                "k{}",
+                rng.gen_range(0..5_000_u32).min(rng.gen_range(0..5_000))
+            );
+            Sharded::access(&engine, key, |_k| {
+                fetched += 1;
+                async { Bytes::new() }
+            })
+            .await;
+            if i % 10_000 == 0 {
+                assert!(engine.structure().main_entries <= 1_000);
+            }
+        }
+        let resident = engine.resident_keys();
+        let structure = engine.structure();
+        assert_eq!(structure.main_entries, resident.len());
+        assert!(resident.len() <= 1_000);
+        assert!(
+            resident.len() > 900,
+            "{} resident: capacity unused",
+            resident.len()
+        );
+        let unique: HashSet<&String> = resident.iter().collect();
+        assert_eq!(unique.len(), resident.len(), "a key is resident twice");
+        // Every fetch admitted a key, and every admitted key is resident or was evicted.
+        assert_eq!(fetched, resident.len() + evicted.lock().unwrap().len());
+    }
+
+    #[tokio::test]
+    async fn sieve_keeps_capacity_and_reports_every_eviction() {
+        check_sharded_policy::<crate::sieve::SieveShard<String, Bytes>>().await;
     }
 
     /// Three keys that hash to the same LRU shard.
