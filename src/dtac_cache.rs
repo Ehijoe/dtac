@@ -2,7 +2,7 @@ use crate::cache_engine::config::EngineConfig;
 use crate::cache_engine::{DtacCacheEngine, EvictionListener};
 use crate::clock::Clock;
 use crate::error::Result;
-use crate::heuristic_router::HeuristicRouter;
+use crate::heuristic_router::{Evidence, HeuristicRouter};
 use crate::types::RequestData;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram};
@@ -118,11 +118,14 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
         // Calculate the score proxying for AI-Score; 0.5 is the fallback if evaluation fails.
         // A probability in [0, 1] loses nothing that matters when narrowed to f32.
         #[allow(clippy::cast_possible_truncation)]
-        let request_bot_prob = self
+        let (request_bot_prob, evidence) = self
             .router
-            .evaluate_request(&request_data)
+            .evaluate_request_detailed(&request_data)
             .await
-            .map_or(0.5, |score| score.value() as f32);
+            .map_or_else(
+                |_| (0.5, Evidence::default()),
+                |eval| (eval.score.value() as f32, eval.evidence),
+            );
         let router_time = start_time.elapsed();
 
         // Track whether it was a hit or miss
@@ -160,6 +163,7 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
         let stats = AccessStats {
             hit: was_hit,
             bot_prob: request_bot_prob,
+            evidence,
             router_time,
             engine_time: total_time.saturating_sub(router_time),
         };
@@ -174,6 +178,8 @@ pub struct AccessStats {
     pub hit: bool,
     /// The router's bot probability for the request, in `[0, 1]`.
     pub bot_prob: f32,
+    /// Which of the router's heuristics fired.
+    pub evidence: Evidence,
     /// Time spent scoring the request in the router (`T_proxy`).
     pub router_time: Duration,
     /// Time spent in the cache engine, including any origin fetch (`T_cache`).

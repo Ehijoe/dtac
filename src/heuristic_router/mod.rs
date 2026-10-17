@@ -128,8 +128,14 @@ impl HeuristicRouter {
     /// Evaluates a request and assigns an AI score.
     ///
     /// Implements the Ingress Proxy Pipeline & Log-Odds AI-Score Generation algorithm.
-    #[instrument(skip(self, req))]
     pub async fn evaluate_request(&self, req: &RequestData) -> Result<AiScore> {
+        Ok(self.evaluate_request_detailed(req).await?.score)
+    }
+
+    /// Like [`evaluate_request`](Self::evaluate_request), but also reports which
+    /// heuristics fired, e.g. to estimate each one's likelihood ratio on labelled traffic.
+    #[instrument(skip(self, req))]
+    pub async fn evaluate_request_detailed(&self, req: &RequestData) -> Result<Evaluation> {
         let start = Instant::now();
         self.eval_requests_counter.add(1, &[]);
 
@@ -174,7 +180,8 @@ impl HeuristicRouter {
 
         // Heuristic A: Continuous Graded Velocity Penalty
         let float_v = f64::from(new_velocity) / 1024.0;
-        if float_v > self.config.burst_threshold {
+        let is_fast = float_v > self.config.burst_threshold;
+        if is_fast {
             score = self
                 .config
                 .alpha
@@ -222,8 +229,39 @@ impl HeuristicRouter {
             "Request evaluated"
         );
 
-        Ok(AiScore::new(bot_probability))
+        Ok(Evaluation {
+            score: AiScore::new(bot_probability),
+            evidence: Evidence {
+                velocity: is_fast,
+                datacenter_asn: is_datacenter,
+                missing_assets,
+                missing_accept_language: !has_accept_lang,
+            },
+        })
     }
+}
+
+/// Which heuristics fired for one request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // one flag per independent heuristic
+pub struct Evidence {
+    /// Heuristic A: the IP's request velocity is above `burst_threshold`.
+    pub velocity: bool,
+    /// Heuristic B: the IP belongs to a datacenter ASN.
+    pub datacenter_asn: bool,
+    /// Heuristic C ("Shy Guys"): the IP never fetches auxiliary assets.
+    pub missing_assets: bool,
+    /// Heuristic D: the request has no `Accept-Language` header.
+    pub missing_accept_language: bool,
+}
+
+/// A request's score and the evidence behind it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Evaluation {
+    /// The bot probability.
+    pub score: AiScore,
+    /// Which heuristics added to the score.
+    pub evidence: Evidence,
 }
 
 impl Default for HeuristicRouter {

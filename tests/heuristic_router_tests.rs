@@ -102,6 +102,43 @@ mod asn_and_shy_guys {
         1.0 / (1.0 + (-x).exp())
     }
 
+    #[tokio::test]
+    async fn detailed_evaluation_reports_which_heuristics_fired() {
+        use dtac::heuristic_router::Evidence;
+
+        let router = HeuristicRouter::with_asn_db(fixture_db());
+        let clean = router
+            .evaluate_request_detailed(&human_request(ISP_IP, "/favicon.ico"))
+            .await
+            .unwrap();
+        assert_eq!(clean.evidence, Evidence::default());
+
+        // A datacenter IP with no Accept-Language, six pages and no assets.
+        let mut last = None;
+        for i in 0..6 {
+            let req = RequestData {
+                headers: HashMap::new(),
+                ..human_request(DATACENTER_IP, &format!("/item/{i}"))
+            };
+            last = Some(router.evaluate_request_detailed(&req).await.unwrap());
+        }
+        let bot = last.unwrap();
+        assert_eq!(
+            bot.evidence,
+            Evidence {
+                velocity: false,
+                datacenter_asn: true,
+                missing_assets: true,
+                missing_accept_language: true,
+            }
+        );
+        let plain = router
+            .evaluate_request(&human_request(ISP_IP, "/item/0"))
+            .await
+            .unwrap();
+        assert!(bot.score.value() > plain.value());
+    }
+
     #[test]
     fn committed_fixture_parses() {
         let db = fixture_db();
