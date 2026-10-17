@@ -1,6 +1,6 @@
 # Plan 004 — Calibration, stronger baselines, ablation, capacity sweep, repeated experiments, networked run
 
-**Status:** not started
+**Status:** implemented (results in `results/summary.md`, calibration in `results/tuning.md`)
 **Depends on:**
 - 002: the clock and the bounded ghost cache.
 - 003: `--seed`, `--json-out`, the `replay_bench` module split, the eviction hooks and `resident_keys`.

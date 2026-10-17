@@ -43,8 +43,9 @@ cargo test <test_name>      # run a single test by name (substring match)
 cargo clippy                # lint — this repo enables pedantic+nursery+cargo clippy lint groups
 ```
 
-Integration tests live in `tests/cache_engine_tests.rs`, `tests/heuristic_router_tests.rs` and
-`tests/dtac_cache_tests.rs`; unit
+Integration tests live in `tests/cache_engine_tests.rs`, `tests/heuristic_router_tests.rs`,
+`tests/dtac_cache_tests.rs` and `tests/networked_tests.rs` (spawns `origin_stub` and
+`dtac_standalone` on ephemeral ports); unit
 tests live inline in `#[cfg(test)]` modules within the source files they test (e.g.
 `src/heuristic_router/score.rs`, `src/heuristic_router/space_saver.rs`).
 
@@ -64,12 +65,15 @@ cargo run --bin dtac_standalone -- --capacity 1024 --target http://127.0.0.1:808
 ```
 
 Starts an Axum HTTP server that proxies all requests to `--target`, caching responses through
-`DtacCache`, and exposes Prometheus metrics at `/metrics`.
+`DtacCache`, and exposes Prometheus metrics at `/metrics`. Responses carry `X-Cache: HIT|MISS`.
+`--trusted-proxy <CIDR>` (repeatable) is the only way `X-Forwarded-For` is believed.
+`--clock replay-header` and `--debug-headers` exist only for the networked benchmark.
 
 ### Benchmarking pipeline
 
 Benchmarking is two separate steps: generate synthetic traffic logs with Python, then replay them
-through the cache engine in-process with Rust (no real network calls).
+through the cache engine in-process with Rust (no real network calls). `scripts/run_experiments.py`
+drives both over the whole experiment grid (see below).
 
 ```bash
 # 1. Generate NDJSON traffic logs into benchmark_logs/ (requires numpy; see scripts/requirements.txt)
@@ -104,10 +108,30 @@ and reports:
 - eviction-by-admitter counts and the Cache Pollution Index;
 - the router as a classifier (ROC-AUC, precision/recall/FPR, new vs. returning visitor FPR).
 
-`--json-out` writes all of it plus the run config and the log's `.meta.json`, and plan 004
-consumes that file. `--quiet` hides the progress bar and the Prometheus dump. This is the main
-tool for evaluating whether router+cache tuning actually improves bot resistance without hurting
-human hit rate.
+`--json-out` writes all of it plus the run config (including the resolved shard count) and the
+log's `.meta.json`. `--quiet` hides the progress bar and the Prometheus dump. `--algorithm` is one
+of `dtac`, `dtac-no-score` (the ablation: DTAC's engine with a constant `sigmoid(l_0)` score),
+`lru`, `sieve` or `s3fifo`; every engine uses the same `--shards` (default `auto`) and
+capacity-per-shard split. `--target-url` replays over HTTP against a running `dtac_standalone`
+instead (with `origin_stub` as its origin).
+
+```bash
+# 3. The experiment grid: calibration on seed 0 first, then seeds 1-5 (resumable)
+python scripts/run_experiments.py tune        # writes results/tuning.md + tuning.json
+python scripts/run_experiments.py --quick     # 20-run smoke test
+python scripts/run_experiments.py             # 350 runs (thesis profile); --profile full: 800
+(cd scripts && python -m unittest test_run_experiments)
+```
+
+`run_experiments.py` writes one `replay_bench --json-out` per cell to `results/raw/` (gitignored)
+and aggregates them into `results/summary.csv` and `results/summary.md`: mean ± 95% t-interval
+over seeds, the paired per-seed differences `dtac − X`, router quality and capacity sweeps.
+Evaluation seeds are refused until `results/tuning.md` exists, seed 0 is never aggregated, and
+results from different commits or configs are refused unless `--allow-mixed`. A run records the
+commit with `-dirty` if tracked files changed, so **don't edit tracked files while a sweep runs**.
+`tune` keeps the hand-written text around its generated block in `tuning.md`. The library
+defaults are its calibrated values, so changing a `RouterConfig`/`EngineConfig` default
+invalidates `results/` until the sweep is rerun.
 
 ## Architecture
 
@@ -129,8 +153,11 @@ recorded.
 pipeline**: start from a baseline prior `l_0`, add weighted contributions from independent heuristics,
 then squash through a sigmoid to get a `[0,1]` bot probability (`AiScore`, in `score.rs`). All
 weights/thresholds live in `RouterConfig` (`config.rs`, serde-deserializable, validated by
-`HeuristicRouter::with_config`); `l_0` is derived from `prior_bot_rate` (default 0.1, so
-`l_0 = ln(0.1/0.9) ≈ −2.20`, and a clean human request scores ≈ 0.1):
+`HeuristicRouter::with_config`; defaults calibrated in `results/tuning.md`); `l_0` is derived from
+`prior_bot_rate` (default 0.02, so `l_0 = ln(0.02/0.98) ≈ −3.89`, and a clean human request scores
+≈ 0.02, `RouterConfig::clean_request_bot_prob`). `evaluate_request_detailed` also returns which
+heuristics fired (`Evidence`), which `AccessStats` carries and `replay_bench` turns into per-heuristic
+firing rates and empirical LLRs:
 
 - **Velocity heuristic**: per-IP request rate tracked as an EWMA using *bitwise right-shift* for
   exponential decay (not floating-point multiply) — `velocity >> delta_t`, fixed-point scaled by
@@ -146,7 +173,7 @@ weights/thresholds live in `RouterConfig` (`config.rs`, serde-deserializable, va
   `--datacenter-asns` via the shared `src/bin/common/mod.rs`. `data/asn/ip2asn-fixture.tsv` is a
   committed fixture matching the generator's datacenter bot IPs (by construction — not evidence
   of real-world accuracy); full downloads in `data/asn/` are gitignored.
-- **"Shy guys" heuristic**: penalizes IPs that have made `shy_page_threshold` (default 5) page
+- **"Shy guys" heuristic**: penalizes IPs that have made `shy_page_threshold` (default 12) page
   requests and *never* fetched an auxiliary asset (`is_auxiliary_asset` in `mod.rs`: favicon,
   apple-touch-icon, or a static-asset extension). `IpState::record_request` updates
   `page_requests`/`has_fetched_asset` and derives `missing_auxiliary_assets` inside the router's
@@ -172,9 +199,11 @@ should preserve that order.
 
 ### Cache engine (`src/cache_engine/mod.rs`)
 
-`DtacCacheEngine<K, P>` shards state across `NUM_SHARDS` (256) independent `Mutex<CacheShard<K, P>>`
-instances, keyed by hashing the resource key, to reduce lock contention under concurrent access. Each
-shard independently runs the same algorithm:
+`DtacCacheEngine<K, P>` shards state across independent `Mutex<CacheShard<K, P>>` instances, keyed
+by `shard_of` (hash of the resource key), to reduce lock contention under concurrent access.
+`EngineConfig.shards` is `"auto"` (the largest power of two ≤ `NUM_SHARDS` = 256 that leaves at
+least `MIN_ENTRIES_PER_SHARD` = 64 entries per shard, so 256 from capacity 16 384) or a fixed count.
+Each shard independently runs the same algorithm:
 
 - **Ghost cache**: metadata-only (no payload) tracking for resources not currently in the main cache.
   Every miss first lands here rather than immediately entering the main cache — this prevents one-off/
@@ -191,7 +220,7 @@ shard independently runs the same algorithm:
   `Metadata.last_accessed` is `u64` milliseconds on the engine's injected `Clock`;
   `Metadata::decayed_score` halves the score once per whole `decay_half_life_ms` and zeroes it after
   `decay_cutoff_half_lives`.
-- **Eviction**: the free function `tournament_victim` samples `n_samples` (default 5) random entries
+- **Eviction**: the free function `tournament_victim` samples `n_samples` (default 8) random entries
   from a dense `(key, meta)` slice and picks the lowest *currently decayed* score (not the lowest
   stored score), breaking ties on the oldest `last_accessed` — a randomized approximation of LFU/LRU
   that avoids maintaining a full priority queue. Main and ghost caches share it, plus
@@ -199,10 +228,10 @@ shard independently runs the same algorithm:
   in the key → index map.
 
 All engine constants are in `EngineConfig` (`src/cache_engine/config.rs`, serde-deserializable,
-validated by `DtacCacheEngine::with_config`). Defaults reproduce the original hard-coded behaviour and
-are provisional until plan 004's calibration.
+validated by `DtacCacheEngine::with_config`). The defaults (4 h half-life, promotion threshold 1.5,
+8 samples, ghost ×8) are plan 004's seed-0 calibration (`results/tuning.md`).
 
-`DtacCacheEngine::with_eviction_listener` takes an `Arc<dyn Fn(&K)>` called with every main-cache
+`DtacCacheEngine::with_eviction_listener` (or `set_eviction_listener`) takes an `Arc<dyn Fn(&K)>` called with every main-cache
 victim *after* the shard lock is released (collect victims inside the lock, notify outside), and
 `resident_keys()` lists main-cache keys (diagnostics only, like `debug_integrity_counts`).
 
@@ -217,11 +246,15 @@ clock if `.clock` isn't called). `DtacCache::new(capacity)` is shorthand for the
 
 ### Binaries (`src/bin/`)
 
-- **`dtac_standalone.rs`**: Axum-based reverse proxy. Wraps a single shared `DtacCache<String, Bytes>`
-  in `Arc`, forwards every path to `--target` via `reqwest` on miss, and exports OpenTelemetry metrics
-  through a Prometheus registry at `/metrics`. Note the client IP is currently hardcoded to
-  `127.0.0.1` rather than extracted from the connection/`X-Forwarded-For` — this means the ASN and
-  per-IP velocity heuristics are not meaningfully exercised when actually running this binary.
+- **`dtac_standalone/`**: Axum-based reverse proxy. Wraps a single shared `DtacCache<String, Bytes>`
+  in `Arc`, forwards the path and query to `--target` through one shared `reqwest::Client` on a miss
+  (the cache key is the path), adds `X-Cache: HIT|MISS` (and `X-Bot-Probability` with
+  `--debug-headers`), and exports OpenTelemetry metrics through a Prometheus registry at `/metrics`.
+  `client_ip.rs` picks the client IP: the TCP peer, or, when the peer is a `--trusted-proxy`, the
+  right-most untrusted `X-Forwarded-For` hop (malformed header → peer). `--clock replay-header`
+  takes time from trusted `X-Replay-Time-Ms` headers so a networked replay runs on log time.
+  `--port 0` prints the bound address as `Listening on <addr>`.
+- **`origin_stub.rs`**: origin for the networked benchmark; returns `?size=N` zero bytes.
 - **`replay_bench/`**: in-process benchmark harness (see Benchmarking pipeline above).
   - `main.rs`: CLI, `LogRecord`, the dispatch loop, `--json-out`. It keeps the NDJSON log in
     memory and dispatches `DtacCache::access_with_stats` calls (`AccessStats`: hit, `bot_prob`,
@@ -230,13 +263,19 @@ clock if `.clock` isn't called). `DtacCache::new(capacity)` is shorthand for the
     and finished tasks are reaped in the loop, so the log stays resident and the RSS delta
     measures the cache. `--clock log` (default) sets a shared `ManualClock` to each record's
     timestamp before its access, so `--speed` only affects run time; `--clock wall` reproduces
-    the old wall-clock behaviour. `--engine-config`/`--router-config` (JSON) and
-    `--ghost-multiplier` set any constant.
+    the old wall-clock behaviour. `--engine-config`/`--router-config` (JSON),
+    `--ghost-multiplier` and `--shards` set any constant. The pipeline (`run`, `dispatch`,
+    `replay_record`) is generic over `BenchEngine`.
   - `metrics.rs`: `BenchMetrics` atomics, `Striped<T>` (per-record-sequence mutex stripes for
     the latency histograms and classifier samples), and the `Report` (Serialize) that is both
     printed and written to `--json-out`.
-  - `engines.rs`: the `Engine` enum and the sharded `BaselineLruEngine`. Plan 004 adds more
-    engines here.
+  - `engines.rs`: the `BenchEngine` trait (`access`, `resident_keys`, `set_eviction_listener`,
+    `name`, `structure`, `configs`), `DtacEngine`, `NoScoreEngine` (the ablation), the sharded
+    `BaselineLruEngine`, and `Sharded<S: ShardPolicy>`, which owns locking, shard choice and
+    eviction notifications for single-threaded per-shard policies.
+  - `sieve.rs` / `s3fifo.rs`: SIEVE (slab + index-linked FIFO, visited bit, moving hand) and
+    S3-FIFO (small/main/ghost FIFOs, 2-bit frequency) as `ShardPolicy` implementations.
+  - `http.rs`: `HttpEngine` for `--target-url`; reads `X-Cache`/`X-Bot-Probability`, no CPI.
   - `classifier.rs`: router quality (AUC by sorting, threshold metrics, histograms).
   - `pollution.rs`: the per-key `Ledger` behind eviction-by-admitter and the CPI. It records the
     label of each key's latest origin fetch and whether a human has requested the key since.
