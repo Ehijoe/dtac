@@ -46,11 +46,13 @@ pub trait BenchEngine: Send + Sync + 'static {
     /// The `--algorithm` value, as written to `--json-out`.
     fn name(&self) -> &'static str;
 
-    /// Looks up `key`, calling `fetch` on a miss. `request` builds the request the
-    /// router scores; engines without a router never call it, so they don't pay for it.
+    /// Looks up `key` (an item of `size` bytes), calling `fetch` on a miss. `request`
+    /// builds the request the router scores; engines without a router never call it, so
+    /// they don't pay for it.
     fn access<R, F, Fut>(
         &self,
         key: String,
+        size: u64,
         request: R,
         fetch: F,
     ) -> impl Future<Output = Outcome> + Send
@@ -67,6 +69,17 @@ pub trait BenchEngine: Send + Sync + 'static {
 
     fn structure(&self) -> Structure;
 
+    /// Whether [`resident_keys`](Self::resident_keys) and the eviction listener see the
+    /// cache. Without them the bench takes no CPI samples.
+    fn observes_residency(&self) -> bool {
+        true
+    }
+
+    /// Requests that failed outright (only possible over the network).
+    fn failed_requests(&self) -> u64 {
+        0
+    }
+
     /// The effective configs, for `--json-out`. `None` where the engine has no such part.
     fn configs(&self) -> (Option<RouterConfig>, Option<EngineConfig>) {
         (None, None)
@@ -81,7 +94,7 @@ impl BenchEngine for DtacEngine {
         "dtac"
     }
 
-    async fn access<R, F, Fut>(&self, key: String, request: R, fetch: F) -> Outcome
+    async fn access<R, F, Fut>(&self, key: String, _size: u64, request: R, fetch: F) -> Outcome
     where
         R: FnOnce() -> RequestData + Send,
         F: FnOnce(&String) -> Fut + Send,
@@ -209,7 +222,7 @@ impl<S: ShardPolicy<String, Bytes> + Send> BenchEngine for Sharded<S> {
         S::NAME
     }
 
-    async fn access<R, F, Fut>(&self, key: String, _request: R, fetch: F) -> Outcome
+    async fn access<R, F, Fut>(&self, key: String, _size: u64, _request: R, fetch: F) -> Outcome
     where
         R: FnOnce() -> RequestData + Send,
         F: FnOnce(&String) -> Fut + Send,
@@ -276,7 +289,7 @@ impl BenchEngine for NoScoreEngine {
         "dtac-no-score"
     }
 
-    async fn access<R, F, Fut>(&self, key: String, _request: R, fetch: F) -> Outcome
+    async fn access<R, F, Fut>(&self, key: String, _size: u64, _request: R, fetch: F) -> Outcome
     where
         R: FnOnce() -> RequestData + Send,
         F: FnOnce(&String) -> Fut + Send,
@@ -398,7 +411,7 @@ impl BenchEngine for BaselineLruEngine<String, Bytes> {
         "lru"
     }
 
-    async fn access<R, F, Fut>(&self, key: String, _request: R, fetch: F) -> Outcome
+    async fn access<R, F, Fut>(&self, key: String, _size: u64, _request: R, fetch: F) -> Outcome
     where
         R: FnOnce() -> RequestData + Send,
         F: FnOnce(&String) -> Fut + Send,
@@ -500,12 +513,13 @@ mod tests {
                 let request = human_request(visitor, &path);
                 dtac.access(
                     path.clone(),
+                    0,
                     || request.clone(),
                     |_k| async { Bytes::new() },
                 )
                 .await;
                 ablation
-                    .access(path.clone(), || request, |_k| async { Bytes::new() })
+                    .access(path.clone(), 0, || request, |_k| async { Bytes::new() })
                     .await;
             }
         }
@@ -540,10 +554,10 @@ mod tests {
         };
         // With the constant 0.1, three requests promote (3 x 0.9 >= 2) whoever sends them.
         for _ in 0..3 {
-            ablation.access("/item/1".to_string(), bot, fetch).await;
+            ablation.access("/item/1".to_string(), 0, bot, fetch).await;
         }
         assert_eq!(ablation.resident_keys(), vec!["/item/1".to_string()]);
-        let outcome = ablation.access("/item/1".to_string(), bot, fetch).await;
+        let outcome = ablation.access("/item/1".to_string(), 0, bot, fetch).await;
         assert_eq!(
             outcome,
             Outcome::default(),

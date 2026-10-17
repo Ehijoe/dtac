@@ -4,6 +4,7 @@ mod classifier;
 #[path = "../common/mod.rs"]
 mod common;
 mod engines;
+mod http;
 mod metrics;
 mod pollution;
 mod s3fifo;
@@ -21,6 +22,7 @@ use dtac::heuristic_router::HeuristicRouter;
 use dtac::heuristic_router::config::RouterConfig;
 use dtac::types::RequestData;
 use engines::{BaselineLruEngine, BenchEngine, DtacEngine, NoScoreEngine, Sharded};
+use http::HttpEngine;
 use indicatif::{ProgressBar, ProgressStyle};
 use metrics::{
     BenchMetrics, MemoryReport, Report, init_metrics, print_prometheus, proc_status_bytes,
@@ -155,6 +157,13 @@ struct Args {
     /// Hide the progress bar and the Prometheus dump, for scripted runs.
     #[arg(short, long)]
     quiet: bool,
+
+    /// Replay over HTTP against a running `dtac_standalone` at this URL instead of an
+    /// in-process engine. Start it with `--trusted-proxy` for this machine,
+    /// `--clock replay-header` and `--debug-headers`, in front of `origin_stub`.
+    /// `--algorithm`, the configs and `--shards` are then the proxy's business.
+    #[arg(long, value_name = "URL")]
+    target_url: Option<String>,
 }
 
 /// The run configuration written to `--json-out` next to the results.
@@ -162,6 +171,8 @@ struct Args {
 struct RunInfo<'a> {
     file: &'a Path,
     algorithm: Algorithm,
+    /// The proxy replayed against with `--target-url`; `None` for in-process runs.
+    target_url: Option<&'a str>,
     capacity: usize,
     /// The resolved shard count the engine ran with.
     shards: usize,
@@ -539,7 +550,7 @@ async fn replay_record<E: BenchEngine>(record: LogRecord, seq: usize, ctx: &Repl
     let req_start = Instant::now();
     let outcome = ctx
         .engine
-        .access(key.clone(), request, fetch_from_origin)
+        .access(key.clone(), size, request, fetch_from_origin)
         .await;
     let total = req_start.elapsed();
     if is_measurement {
@@ -622,6 +633,7 @@ async fn dispatch<E: BenchEngine>(
         if record.phase == Phase::Measurement {
             if measurement_dispatched > 0
                 && measurement_dispatched.is_multiple_of(args.cpi_sample_every)
+                && ctx.engine.observes_residency()
             {
                 ctx.metrics.ledger.sample(&ctx.engine.resident_keys());
             }
@@ -650,7 +662,9 @@ async fn dispatch<E: BenchEngine>(
 
     // Drain remaining in-flight work after the dispatch loop finishes issuing records.
     while join_set.join_next().await.is_some() {}
-    ctx.metrics.ledger.sample(&ctx.engine.resident_keys());
+    if ctx.engine.observes_residency() {
+        ctx.metrics.ledger.sample(&ctx.engine.resident_keys());
+    }
 
     pb.finish_with_message("Replay Complete");
     Ok(start_time.elapsed())
@@ -693,6 +707,7 @@ fn write_json_out(
         run: RunInfo {
             file: &args.file,
             algorithm: args.algorithm,
+            target_url: args.target_url.as_deref(),
             capacity: args.capacity,
             shards: engine.structure().shards,
             concurrency: args.concurrency,
@@ -754,6 +769,12 @@ async fn run<E: BenchEngine>(
     if !args.quiet {
         print_prometheus(registry);
     }
+    let failed = ctx.engine.failed_requests();
+    if failed > 0 {
+        return Err(
+            format!("{failed} requests to the target failed; the results are invalid").into(),
+        );
+    }
     if let Some(path) = &args.json_out {
         write_json_out(path, args, &ctx.engine, &report)?;
     }
@@ -782,6 +803,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_run_header(&args, &records);
 
     let log_clock = (args.clock == ClockMode::Log).then(|| Arc::new(ManualClock::new(0)));
+    if let Some(url) = &args.target_url {
+        println!("Target:         {url} (networked replay)");
+        let engine = HttpEngine::new(url, log_clock.clone());
+        return run(engine, &args, records, log_clock, &registry).await;
+    }
     match args.algorithm {
         Algorithm::Dtac => {
             let engine = build_dtac(&args, log_clock.as_ref())?;
