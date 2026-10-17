@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration of the cache engine's score decay, promotion and eviction.
 ///
-/// The defaults reproduce the engine's original hard-coded behaviour. They are
-/// provisional: on log-timestamp replays they decay scores far too quickly, and plan
-/// 004 calibrates them.
+/// The defaults were calibrated on the benchmark's tuning seed (plan 004, part 0; see
+/// `results/tuning.md`), which the reported results never use. The original hard-coded
+/// values (1 s half-life, threshold 2, 5 samples, ghost ×4) decayed scores far too
+/// quickly on log time.
 ///
 /// Deserializes from JSON; missing fields take their [`Default`] values, so a config file
 /// only has to list the constants it changes.
@@ -107,7 +108,7 @@ impl From<Shards> for ShardsRepr {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            decay_half_life_ms: 1000,
+            decay_half_life_ms: 4 * 60 * 60 * 1000,
             decay_cutoff_half_lives: 32,
             promotion_threshold: PROMOTION_THRESHOLD,
             n_samples: N_SAMPLES,

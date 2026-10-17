@@ -102,11 +102,22 @@ mod asn_and_shy_guys {
         1.0 / (1.0 + (-x).exp())
     }
 
+    /// A router that flags shy IPs after 5 pages and never fires velocity, so these
+    /// tests don't depend on how fast the system clock ticks between requests.
+    fn shy_after_five(asn_db: AsnDatabase) -> HeuristicRouter {
+        let config = RouterConfig {
+            shy_page_threshold: 5,
+            burst_threshold: 1_000.0,
+            ..Default::default()
+        };
+        HeuristicRouter::with_config(config, asn_db).unwrap()
+    }
+
     #[tokio::test]
     async fn detailed_evaluation_reports_which_heuristics_fired() {
         use dtac::heuristic_router::Evidence;
 
-        let router = HeuristicRouter::with_asn_db(fixture_db());
+        let router = shy_after_five(fixture_db());
         let clean = router
             .evaluate_request_detailed(&human_request(ISP_IP, "/favicon.ico"))
             .await
@@ -212,7 +223,7 @@ mod asn_and_shy_guys {
 
     #[tokio::test]
     async fn shy_guys_flags_ips_that_never_fetch_assets() {
-        let router = HeuristicRouter::new();
+        let router = shy_after_five(AsnDatabase::empty());
         let pages = ["/item/1", "/item/2", "/item/3", "/item/4", "/item/5"];
 
         // Same request count (6) for A and B, so velocity is equal.
@@ -236,8 +247,9 @@ mod asn_and_shy_guys {
     async fn clean_human_scores_at_the_prior() {
         let router = HeuristicRouter::new();
         let got = score(&router, &human_request(ISP_IP, "/item/1")).await;
-        assert!((got - sigmoid((1.0_f64 / 9.0).ln())).abs() < 1e-6);
-        assert!((got - 0.1).abs() < 1e-6);
+        assert!((got - sigmoid((0.02_f64 / 0.98).ln())).abs() < 1e-6);
+        assert!((got - 0.02).abs() < 1e-6);
+        assert!((got - router.config().clean_request_bot_prob()).abs() < 1e-6);
     }
 
     #[tokio::test]
@@ -254,7 +266,7 @@ mod asn_and_shy_guys {
         let mut no_header = human_request("24.9.9.9", "/item/1");
         no_header.headers.clear();
         let header_only = score(&router, &no_header).await;
-        assert!((header_only - sigmoid(1.0)).abs() < 1e-12);
+        assert!((header_only - sigmoid(RouterConfig::default().w_hdr)).abs() < 1e-12);
     }
 
     #[test]
@@ -279,7 +291,16 @@ mod simulated_clock {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    const PRIOR: f64 = 0.1;
+    const PRIOR: f64 = 0.02;
+
+    /// The pre-calibration velocity constants: 1 s ticks, threshold 10.
+    fn one_second_ticks() -> RouterConfig {
+        RouterConfig {
+            velocity_tick_ms: 1000,
+            burst_threshold: 10.0,
+            ..Default::default()
+        }
+    }
 
     fn router(config: RouterConfig) -> (HeuristicRouter, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::new(0));
@@ -316,7 +337,7 @@ mod simulated_clock {
 
     #[tokio::test]
     async fn burst_within_one_second_trips_velocity() {
-        let (router, clock) = router(RouterConfig::default());
+        let (router, clock) = router(one_second_ticks());
         let times: Vec<u64> = (0..20).map(|i| i * 50).collect();
         let max = max_score(&router, &clock, &times).await;
         assert!(
@@ -327,7 +348,7 @@ mod simulated_clock {
 
     #[tokio::test]
     async fn same_requests_spread_over_twenty_seconds_do_not() {
-        let (router, clock) = router(RouterConfig::default());
+        let (router, clock) = router(one_second_ticks());
         let times: Vec<u64> = (0..20).map(|i| i * 1000).collect();
         let max = max_score(&router, &clock, &times).await;
         assert!(
@@ -336,27 +357,30 @@ mod simulated_clock {
         );
     }
 
-    /// Documents a known gap rather than desired behaviour: on log time, the default
-    /// velocity constants never flag the benchmark's per-IP bot rate (its EWMA settles
-    /// around 7, below `burst_threshold = 10`). Expected to change when plan 004 picks
-    /// calibrated defaults.
+    /// The gap plan 004's calibration closed: with the old 1 s ticks and threshold 10, the
+    /// benchmark's per-IP bot rate never trips velocity (its EWMA settles around 7).
     #[tokio::test]
-    async fn default_config_misses_benchmark_bot_rate() {
-        let (router, clock) = router(RouterConfig::default());
+    async fn one_second_ticks_miss_benchmark_bot_rate() {
+        let (router, clock) = router(one_second_ticks());
         let max = max_score(&router, &clock, &benchmark_bot_rate_times()).await;
         assert!((max - PRIOR).abs() < 1e-6, "expected no penalty, got {max}");
     }
 
     #[tokio::test]
-    async fn longer_velocity_tick_flags_benchmark_bot_rate() {
-        let (router, clock) = router(RouterConfig {
-            velocity_tick_ms: 5000,
-            ..Default::default()
-        });
+    async fn default_config_flags_benchmark_bot_rate() {
+        let (router, clock) = router(RouterConfig::default());
         let max = max_score(&router, &clock, &benchmark_bot_rate_times()).await;
         assert!(
-            max > PRIOR + 1e-6,
-            "5 s ticks should flag 3.6 req/s, got {max}"
+            max > 0.5,
+            "the calibrated 5 s ticks should flag 3.6 req/s, got {max}"
         );
+    }
+
+    #[tokio::test]
+    async fn default_config_ignores_a_reader_paging_every_ten_seconds() {
+        let (router, clock) = router(RouterConfig::default());
+        let times: Vec<u64> = (0..20).map(|i| i * 10_000).collect();
+        let max = max_score(&router, &clock, &times).await;
+        assert!((max - PRIOR).abs() < 1e-6, "got {max}");
     }
 }

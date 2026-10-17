@@ -1,0 +1,22 @@
+{
+  "router_config": {
+    "prior_bot_rate": 0.02,
+    "w_asn": 3.0,
+    "w_fav": 2.0,
+    "w_hdr": 4.0,
+    "burst_threshold": 3.0,
+    "alpha": 2.0,
+    "shy_page_threshold": 12,
+    "velocity_tick_ms": 5000,
+    "velocity_reset_ticks": 10,
+    "space_saver_half_life_s": 3600
+  },
+  "engine_config": {
+    "decay_half_life_ms": 14400000,
+    "decay_cutoff_half_lives": 32,
+    "promotion_threshold": 1.5,
+    "n_samples": 8,
+    "ghost_multiplier": 8,
+    "shards": "auto"
+  }
+}

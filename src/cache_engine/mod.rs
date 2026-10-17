@@ -25,15 +25,15 @@ pub const MIN_ENTRIES_PER_SHARD: usize = 64;
 
 /// Default number of random items selected during an eviction tournament
 /// ([`EngineConfig::n_samples`]).
-pub const N_SAMPLES: usize = 5;
+pub const N_SAMPLES: usize = 8;
 
 /// Default score threshold required to promote an item from Ghost Cache to Main Cache
 /// ([`EngineConfig::promotion_threshold`]).
-pub const PROMOTION_THRESHOLD: f32 = 2.0;
+pub const PROMOTION_THRESHOLD: f32 = 1.5;
 
 /// Default ghost-cache capacity per shard, as a multiple of the main-cache capacity per
 /// shard ([`EngineConfig::ghost_multiplier`]).
-pub const GHOST_CAPACITY_MULTIPLIER: usize = 4;
+pub const GHOST_CAPACITY_MULTIPLIER: usize = 8;
 
 /// A callback told about every key evicted from the main cache, e.g. to log evictions by
 /// origin. See [`DtacCacheEngine::with_eviction_listener`].
@@ -632,10 +632,14 @@ mod tests {
 
     #[test]
     fn hot_entry_decayed_to_zero_loses_the_tournament() {
-        // Default config: halve per second, zero after 32 s. 40 s later the hot entry's
-        // stored score of 100 is worth less than a fresh entry's 0.5.
+        // Halve per second, zero after 32 s: 40 s later the hot entry's stored score of
+        // 100 is worth less than a fresh entry's 0.5.
+        let config = EngineConfig {
+            decay_half_life_ms: 1_000,
+            ..exhaustive()
+        };
         let entries = [("hot", meta(100.0, 0)), ("fresh", meta(0.5, 40_000))];
-        let victim = tournament_victim(&entries, 40_000, &exhaustive(), &mut rng());
+        let victim = tournament_victim(&entries, 40_000, &config, &mut rng());
         assert_eq!(victim, Some(0));
     }
 
@@ -696,6 +700,7 @@ mod tests {
         let clock = Arc::new(crate::clock::ManualClock::new(0));
         let config = EngineConfig {
             n_samples: 64,
+            ghost_multiplier: 4,
             shards: Shards::Fixed(NUM_SHARDS),
             ..Default::default()
         };

@@ -144,7 +144,10 @@ mod configured {
 
     #[tokio::test]
     async fn decay_follows_the_injected_clock() {
-        let (engine, clock) = engine(EngineConfig::default());
+        let (engine, clock) = engine(EngineConfig {
+            decay_half_life_ms: 1_000,
+            ..Default::default()
+        });
         for _ in 0..5 {
             human_access(&engine, "hot").await;
         }
@@ -212,7 +215,7 @@ async fn ghost_cache_stays_bounded_under_a_unique_key_scan() {
     let engine = DtacCacheEngine::<String, ()>::new(1024);
     let bound = engine.ghost_capacity_per_shard();
     assert_eq!(engine.shard_count(), 16, "auto: 64 entries per shard");
-    assert_eq!(bound, 64 * 4, "1024 / 16 shards * default multiplier 4");
+    assert_eq!(bound, 64 * 8, "1024 / 16 shards * default multiplier 8");
 
     for i in 0..100_000 {
         engine.access(format!("scan-{i}"), 0.5, |_k| async {}).await;

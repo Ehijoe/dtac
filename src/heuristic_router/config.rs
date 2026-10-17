@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 pub struct RouterConfig {
     /// Assumed base rate of bot traffic before any evidence, in `(0, 1)`.
     ///
-    /// The baseline log-odds is `l_0 = ln(p / (1 − p))`. The default of `0.1`
-    /// (`l_0 ≈ −2.20`) means "assume human until the evidence says otherwise": a clean
-    /// human request scores `bot_prob ≈ 0.1`. A value of `0.5` gives `l_0 = 0`, the
+    /// The baseline log-odds is `l_0 = ln(p / (1 − p))`. The default of `0.02`
+    /// (`l_0 ≈ −3.89`) means "assume human until the evidence says otherwise": a clean
+    /// human request scores `bot_prob ≈ 0.02`. A value of `0.5` gives `l_0 = 0`, the
     /// router's original behaviour.
     pub prior_bot_rate: f64,
     /// Log-odds added when the client IP belongs to a datacenter ASN (Heuristic B).
@@ -40,7 +40,7 @@ pub struct RouterConfig {
     ///
     /// The per-IP velocity EWMA is halved (right-shifted) once per tick boundary
     /// crossed since the IP's previous request. Ticks are aligned to the clock's epoch,
-    /// so with the default of 1000 a request at 0.9 s and one at 1.1 s are one tick apart.
+    /// so with 1000 a request at 0.9 s and one at 1.1 s are one tick apart.
     pub velocity_tick_ms: u64,
     /// Number of elapsed ticks after which the velocity resets to a single request
     /// instead of being decayed.
@@ -50,17 +50,20 @@ pub struct RouterConfig {
     pub space_saver_half_life_s: u64,
 }
 
+/// The defaults were calibrated on the benchmark's tuning seed (plan 004, part 0; see
+/// `results/tuning.md`), which the reported results never use. They fit the synthetic
+/// workload, not real traffic.
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
-            prior_bot_rate: 0.1,
-            w_asn: 1.5,
-            w_fav: 1.2,
-            w_hdr: 1.0,
-            burst_threshold: 10.0,
+            prior_bot_rate: 0.02,
+            w_asn: 3.0,
+            w_fav: 2.0,
+            w_hdr: 4.0,
+            burst_threshold: 3.0,
             alpha: 2.0,
-            shy_page_threshold: 5,
-            velocity_tick_ms: 1000,
+            shy_page_threshold: 12,
+            velocity_tick_ms: 5000,
             velocity_reset_ticks: 10,
             space_saver_half_life_s: 3600,
         }
@@ -135,7 +138,7 @@ mod tests {
         };
         assert!(even.prior_log_odds().abs() < 1e-12);
         let low = RouterConfig::default();
-        assert!((low.prior_log_odds() - (1.0_f64 / 9.0).ln()).abs() < 1e-12);
+        assert!((low.prior_log_odds() - (0.02_f64 / 0.98).ln()).abs() < 1e-12);
     }
 
     #[test]

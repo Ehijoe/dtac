@@ -67,6 +67,7 @@ fn engine_config_is_applied_and_validated() {
 #[tokio::test]
 async fn access_decays_on_the_shared_clock() {
     let clock = Arc::new(ManualClock::new(0));
+    let half_life = EngineConfig::default().decay_half_life_ms;
     let cache = DtacCache::<String, String>::builder(1024)
         .clock(clock.clone())
         .build();
@@ -77,7 +78,7 @@ async fn access_decays_on_the_shared_clock() {
     let fresh = cache.engine().debug_score(&key).unwrap();
     assert!(fresh > 0.0);
 
-    clock.advance(Duration::from_secs(1));
+    clock.advance(Duration::from_millis(half_life));
     let halved = cache.engine().debug_score(&key).unwrap();
     assert!((halved - fresh / 2.0).abs() < f32::EPSILON);
 }

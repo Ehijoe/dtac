@@ -552,8 +552,9 @@ mod tests {
             headers: HashMap::new(),
             ..human_request(0, "/item/1")
         };
-        // With the constant 0.1, three requests promote (3 x 0.9 >= 2) whoever sends them.
-        for _ in 0..3 {
+        // With the default constant 0.02, two requests promote (2 x 0.98 >= 1.5) whoever
+        // sends them.
+        for _ in 0..2 {
             ablation.access("/item/1".to_string(), 0, bot, fetch).await;
         }
         assert_eq!(ablation.resident_keys(), vec!["/item/1".to_string()]);
@@ -563,7 +564,7 @@ mod tests {
             Outcome::default(),
             "no router, so no score or phases"
         );
-        assert_eq!(fetches.load(Ordering::Relaxed), 3);
+        assert_eq!(fetches.load(Ordering::Relaxed), 2);
     }
 
     /// Replays 100k skewed random requests through a sharded baseline and checks the
