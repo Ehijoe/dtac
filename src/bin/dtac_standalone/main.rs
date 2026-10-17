@@ -7,18 +7,19 @@ mod common;
 use axum::{
     Router,
     extract::{ConnectInfo, Request, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     routing::{any, get},
 };
 use clap::Parser;
 use client_ip::Cidr;
 use common::AsnArgs;
+use dtac::clock::ManualClock;
 use dtac::dtac_cache::DtacCache;
 use dtac::heuristic_router::HeuristicRouter;
 use dtac::types::RequestData;
 use prometheus::{Encoder, TextEncoder};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -34,30 +35,70 @@ struct Args {
     #[arg(short = 't', long, default_value = "http://127.0.0.1:8081")]
     target: String,
 
-    /// Port to listen on
+    /// Port to listen on; 0 picks a free one. The bound address is printed to stdout as
+    /// `Listening on <addr>`.
     #[arg(short = 'p', long, default_value_t = 8080)]
     port: u16,
+
+    /// Address to listen on.
+    #[arg(long, default_value = "0.0.0.0")]
+    bind: IpAddr,
 
     /// A reverse proxy (CIDR or single address) whose `X-Forwarded-For` header is
     /// believed. Repeat for several. Without any, the TCP peer is always the client.
     #[arg(long = "trusted-proxy", value_name = "CIDR")]
     trusted_proxies: Vec<Cidr>,
 
+    /// Where the cache reads time from. `replay-header` is for benchmarking only: time
+    /// is whatever the latest `X-Replay-Time-Ms` header from a trusted proxy said, so
+    /// `replay_bench --target-url` can replay a log on its own timestamps, as it does
+    /// in process.
+    #[arg(long, value_enum, default_value_t = ClockMode::System)]
+    clock: ClockMode,
+
+    /// Add `X-Bot-Probability: <score>` to every response. Benchmarking only: it tells
+    /// clients how bot-like they look.
+    #[arg(long)]
+    debug_headers: bool,
+
     #[command(flatten)]
     asn: AsnArgs,
 }
+
+/// Time source for the cache, `--clock`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ClockMode {
+    /// The system clock.
+    System,
+    /// Simulated time from trusted `X-Replay-Time-Ms` headers.
+    ReplayHeader,
+}
+
+/// The header `--clock replay-header` takes time from, in milliseconds.
+const REPLAY_TIME_HEADER: &str = "x-replay-time-ms";
 
 /// Handles a single proxied request.
 ///
 /// The client IP is the TCP peer, or, when the peer is a `--trusted-proxy`, the
 /// right-most untrusted `X-Forwarded-For` hop (see [`client_ip::client_ip`]). The cache
-/// key is the path; the origin is asked for the path and query string.
+/// key is the path; the origin is asked for the path and query string. The response
+/// says `X-Cache: HIT` or `X-Cache: MISS`.
 #[axum::debug_handler]
 async fn proxy_handler(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(clock) = &state.replay_clock
+        && client_ip::is_trusted(addr.ip(), &state.trusted_proxies)
+        && let Some(millis) = req
+            .headers()
+            .get(REPLAY_TIME_HEADER)
+            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+    {
+        clock.set_millis(millis);
+    }
+
     let path = req.uri().path().to_string();
     let path_and_query = req
         .uri()
@@ -94,10 +135,22 @@ async fn proxy_handler(
         }
     };
 
-    state
+    let (payload, access) = state
         .cache
-        .access(path, request_data, fetch_from_origin)
-        .await
+        .access_with_stats(path, request_data, fetch_from_origin)
+        .await;
+    let mut response = payload.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-cache",
+        HeaderValue::from_static(if access.hit { "HIT" } else { "MISS" }),
+    );
+    if state.debug_headers
+        && let Ok(score) = HeaderValue::from_str(&access.bot_prob.to_string())
+    {
+        headers.insert("x-bot-probability", score);
+    }
+    response
 }
 
 #[derive(Clone)]
@@ -107,6 +160,9 @@ struct AppState {
     /// One pooled client for every origin fetch.
     client: reqwest::Client,
     trusted_proxies: Arc<[Cidr]>,
+    /// The cache's clock under `--clock replay-header`.
+    replay_clock: Option<Arc<ManualClock>>,
+    debug_headers: bool,
     registry: prometheus::Registry,
 }
 
@@ -147,7 +203,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     tracing::info!("Initializing DTAC Proxy with capacity: {}", args.capacity);
     tracing::info!("Forwarding to target: {}", args.target);
-    tracing::info!("Listening on port: {}", args.port);
 
     let router = match args.asn.load() {
         Ok(Some(asn_db)) => {
@@ -164,7 +219,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
-    let cache = Arc::new(DtacCache::builder(args.capacity).router(router).build());
+    let replay_clock =
+        (args.clock == ClockMode::ReplayHeader).then(|| Arc::new(ManualClock::new(0)));
+    let mut builder = DtacCache::builder(args.capacity).router(router);
+    if let Some(clock) = &replay_clock {
+        if args.trusted_proxies.is_empty() {
+            return Err("--clock replay-header needs a --trusted-proxy to take time from".into());
+        }
+        builder = builder.clock(clock.clone());
+    }
+    let cache = Arc::new(builder.build());
     if !args.trusted_proxies.is_empty() {
         tracing::info!(trusted = ?args.trusted_proxies, "Believing X-Forwarded-For from these peers");
     }
@@ -173,6 +237,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         target: args.target.clone(),
         client: reqwest::Client::new(),
         trusted_proxies: args.trusted_proxies.clone().into(),
+        replay_clock,
+        debug_headers: args.debug_headers,
         registry,
     };
 
@@ -181,8 +247,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fallback(any(proxy_handler))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.bind, args.port)).await?;
+    // Printed (not logged) so scripts and tests can find an ephemeral port.
+    println!("Listening on {}", listener.local_addr()?);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

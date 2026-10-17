@@ -103,6 +103,11 @@ fn parse_hop(hop: &str) -> Option<IpAddr> {
     addr.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4)
 }
 
+/// Whether `peer` is one of the `trusted` proxies, whose forwarded headers count.
+pub fn is_trusted(peer: IpAddr, trusted: &[Cidr]) -> bool {
+    trusted.iter().any(|cidr| cidr.contains(peer))
+}
+
 /// The client address for a request from TCP peer `peer` with the given
 /// `X-Forwarded-For` header values (several headers are read as one list).
 ///
@@ -116,8 +121,7 @@ pub fn client_ip<'a>(
     trusted: &[Cidr],
 ) -> IpAddr {
     let peer = peer.to_canonical();
-    let is_trusted = |ip: IpAddr| trusted.iter().any(|cidr| cidr.contains(ip));
-    if !is_trusted(peer) {
+    if !is_trusted(peer, trusted) {
         return peer;
     }
     let hops: Option<Vec<IpAddr>> = forwarded_for
@@ -131,7 +135,7 @@ pub fn client_ip<'a>(
     hops.iter()
         .rev()
         .copied()
-        .find(|&ip| !is_trusted(ip))
+        .find(|&ip| !is_trusted(ip, trusted))
         .unwrap_or(hops[0])
 }
 
