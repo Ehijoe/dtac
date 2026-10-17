@@ -16,7 +16,7 @@ use asn_db::AsnDatabase;
 use config::RouterConfig;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram};
-use score::AiScore;
+use score::{AiScore, sigmoid};
 use space_saver::SpaceSaver;
 use std::sync::Arc;
 use std::time::Instant;
@@ -205,7 +205,7 @@ impl HeuristicRouter {
         }
 
         // --- PHASE 4: Sigmoid Conversion & Forwarding ---
-        let bot_probability = 1.0 / (1.0 + (-score).exp());
+        let bot_probability = sigmoid(score);
 
         let duration = start.elapsed().as_secs_f64();
         self.eval_duration.record(duration, &[]);

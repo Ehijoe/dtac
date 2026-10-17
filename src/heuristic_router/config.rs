@@ -74,6 +74,12 @@ impl RouterConfig {
         (p / (1.0 - p)).ln()
     }
 
+    /// The bot probability of a request no heuristic fires on, `sigmoid(l_0)`, exactly as
+    /// the router computes it. Equal to `prior_bot_rate` up to rounding.
+    pub fn clean_request_bot_prob(&self) -> f64 {
+        super::score::sigmoid(self.prior_log_odds())
+    }
+
     /// Checks that every constant is in its valid range.
     pub fn validate(&self) -> Result<()> {
         let invalid = |msg: String| Err(DTACError::ConfigError(msg));
@@ -130,6 +136,12 @@ mod tests {
         assert!(even.prior_log_odds().abs() < 1e-12);
         let low = RouterConfig::default();
         assert!((low.prior_log_odds() - (1.0_f64 / 9.0).ln()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn clean_request_scores_the_prior() {
+        let cfg = RouterConfig::default();
+        assert!((cfg.clean_request_bot_prob() - cfg.prior_bot_rate).abs() < 1e-12);
     }
 
     #[test]

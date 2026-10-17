@@ -32,6 +32,11 @@ impl AiScore {
     }
 }
 
+/// The logistic function, mapping log-odds to a probability.
+pub fn sigmoid(log_odds: f64) -> f64 {
+    1.0 / (1.0 + (-log_odds).exp())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
