@@ -10,7 +10,13 @@ import unittest
 from pathlib import Path
 
 from run_experiments import (
+    GENERATED_END,
+    GENERATED_START,
     Cell,
+    _candidates,
+    _refined,
+    choose,
+    write_tuning_md,
     HarnessError,
     aggregate,
     check_consistent,
@@ -235,6 +241,53 @@ class ResumeTest(unittest.TestCase):
         (rec,) = load_records(self.raw)
         self.assertEqual(rec.cell, Cell(4, "stealthy", 0.5, "s3fifo", 5_000))
         self.assertAlmostEqual(rec.metric("human_hit_rate"), 0.3)
+
+
+class TuneHelpersTest(unittest.TestCase):
+    def test_refined_values_are_midpoints_around_the_choice(self):
+        self.assertEqual(_refined([1, 2, 4, 8], 4), [3.0, 6.0])
+        self.assertEqual(_refined([1, 2, 4, 8], 1), [1.5])
+        self.assertEqual(_refined([1, 2], 5), [])
+
+    def test_candidates_cover_the_group_and_the_current_value(self):
+        combos = _candidates({"velocity_tick_ms": [1000, 5000], "burst_threshold": [3, 10]},
+                             {"velocity_tick_ms": 2000, "burst_threshold": 10.0})
+        self.assertEqual(len(combos), 5)
+        self.assertIn({"velocity_tick_ms": 2000, "burst_threshold": 10.0}, combos)
+        self.assertIsInstance(combos[0]["velocity_tick_ms"], int)
+        self.assertIsInstance(combos[0]["burst_threshold"], float)
+
+    def test_choose_keeps_the_current_value_unless_clearly_better(self):
+        current = {"w": 1.0}
+        cands = [{"overrides": {"w": w}, "s": s} for w, s in [(0.5, 0.40), (1.0, 0.50), (2.0, 0.5005),
+                                                               (4.0, 0.5008)]]
+        score = lambda c: c["s"]
+        choice, best = choose(cands, current, score, lambda c: True, tolerance=1e-3)
+        self.assertEqual(choice["overrides"], {"w": 1.0})
+        self.assertEqual(best["overrides"], {"w": 4.0})
+        choice, _ = choose(cands, current, score, lambda c: True, tolerance=1e-4)
+        self.assertEqual(choice["overrides"], {"w": 4.0})
+
+    def test_choose_respects_feasibility(self):
+        cands = [{"overrides": {"w": 1.0}, "s": 0.5, "ok": True},
+                 {"overrides": {"w": 3.0}, "s": 0.9, "ok": False}]
+        choice, best = choose(cands, {"w": 1.0}, lambda c: c["s"], lambda c: c["ok"], 1e-3)
+        self.assertIs(choice, best)
+        self.assertEqual(choice["overrides"], {"w": 1.0})
+
+    def test_tuning_md_keeps_hand_written_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tuning.md"
+            write_tuning_md(path, f"{GENERATED_START}\nv1\n{GENERATED_END}")
+            text = path.read_text()
+            path.write_text("# Title\n\nReasoning by hand.\n\n" + text[text.index(GENERATED_START):]
+                            + "\nMore notes.\n")
+            write_tuning_md(path, f"{GENERATED_START}\nv2\n{GENERATED_END}")
+            text = path.read_text()
+            self.assertIn("Reasoning by hand.", text)
+            self.assertIn("More notes.", text)
+            self.assertIn("v2", text)
+            self.assertNotIn("v1", text)
 
 
 if __name__ == "__main__":
