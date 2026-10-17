@@ -1,11 +1,122 @@
 //! Cache engines `replay_bench` can replay a log against.
 
+use bytes::Bytes;
+use dtac::cache_engine::config::EngineConfig;
 use dtac::cache_engine::{EvictionListener, shard_of};
 use dtac::dtac_cache::DtacCache;
+use dtac::heuristic_router::config::RouterConfig;
+use dtac::types::RequestData;
 use lru::LruCache;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+/// What one access did besides returning the payload. Hits and misses are counted
+/// through the fetch closure, which only runs on a miss.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Outcome {
+    /// The router's bot probability, for the classifier report. `None` for engines
+    /// that don't score requests.
+    pub bot_prob: Option<f32>,
+    /// `(T_proxy, T_cache)` for engines that time their own phases. For the others the
+    /// bench counts the whole access as `T_cache`.
+    pub phases: Option<(Duration, Duration)>,
+}
+
+/// Sizes of an engine's structures at the end of a replay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Structure {
+    pub shards: usize,
+    pub main_entries: usize,
+    /// Metadata-only entries (DTAC's ghost cache, S3FIFO's ghost queue).
+    pub ghost_entries: Option<usize>,
+    pub ghost_capacity_per_shard: Option<usize>,
+    /// IPs the router's `SpaceSaver` tracks, for engines with a router.
+    pub tracked_ips: Option<usize>,
+}
+
+/// A cache `replay_bench` can drive. Every engine shards keys with
+/// [`shard_of`] and splits its capacity evenly across the shards, so engines differ
+/// only in policy.
+pub trait BenchEngine: Send + Sync + 'static {
+    /// The `--algorithm` value, as written to `--json-out`.
+    fn name(&self) -> &'static str;
+
+    /// Looks up `key`, calling `fetch` on a miss. `request` builds the request the
+    /// router scores; engines without a router never call it, so they don't pay for it.
+    fn access<R, F, Fut>(
+        &self,
+        key: String,
+        request: R,
+        fetch: F,
+    ) -> impl Future<Output = Outcome> + Send
+    where
+        R: FnOnce() -> RequestData + Send,
+        F: FnOnce(&String) -> Fut + Send,
+        Fut: Future<Output = Bytes> + Send;
+
+    /// The keys currently cached. Locks every shard in turn; diagnostics only.
+    fn resident_keys(&self) -> Vec<String>;
+
+    /// Calls `listener` with every key evicted from the cache, outside any shard lock.
+    fn set_eviction_listener(&mut self, listener: EvictionListener<String>);
+
+    fn structure(&self) -> Structure;
+
+    /// The effective configs, for `--json-out`. `None` where the engine has no such part.
+    fn configs(&self) -> (Option<RouterConfig>, Option<EngineConfig>) {
+        (None, None)
+    }
+}
+
+/// DTAC's full pipeline: the router scores each request and the engine uses the score.
+pub struct DtacEngine(pub DtacCache<String, Bytes>);
+
+impl BenchEngine for DtacEngine {
+    fn name(&self) -> &'static str {
+        "dtac"
+    }
+
+    async fn access<R, F, Fut>(&self, key: String, request: R, fetch: F) -> Outcome
+    where
+        R: FnOnce() -> RequestData + Send,
+        F: FnOnce(&String) -> Fut + Send,
+        Fut: Future<Output = Bytes> + Send,
+    {
+        let (_, stats) = self.0.access_with_stats(key, request(), fetch).await;
+        Outcome {
+            bot_prob: Some(stats.bot_prob),
+            phases: Some((stats.router_time, stats.engine_time)),
+        }
+    }
+
+    fn resident_keys(&self) -> Vec<String> {
+        self.0.engine().resident_keys()
+    }
+
+    fn set_eviction_listener(&mut self, listener: EvictionListener<String>) {
+        self.0.set_eviction_listener(listener);
+    }
+
+    fn structure(&self) -> Structure {
+        let engine = self.0.engine();
+        Structure {
+            shards: engine.shard_count(),
+            main_entries: engine.len(),
+            ghost_entries: Some(engine.ghost_len()),
+            ghost_capacity_per_shard: Some(engine.ghost_capacity_per_shard()),
+            tracked_ips: Some(self.0.router().tracked_ips()),
+        }
+    }
+
+    fn configs(&self) -> (Option<RouterConfig>, Option<EngineConfig>) {
+        (
+            Some(*self.0.router().config()),
+            Some(*self.0.engine().config()),
+        )
+    }
+}
 
 /// A standard, bot-unaware sharded LRU cache: the baseline that
 /// `--algorithm lru` benchmarks against DTAC's own engine. Shards the same
@@ -34,10 +145,8 @@ impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
 
     /// Calls `listener` with every evicted key, after the shard lock is released, like
     /// `DtacCacheEngine::with_eviction_listener`.
-    #[must_use]
-    pub fn with_eviction_listener(mut self, listener: EvictionListener<K>) -> Self {
+    pub fn set_eviction_listener(&mut self, listener: EvictionListener<K>) {
         self.eviction_listener = Some(listener);
-        self
     }
 
     /// The keys currently cached, across all shards. Diagnostics only.
@@ -92,18 +201,34 @@ impl<K: Eq + Hash + Clone, P: Clone> BaselineLruEngine<K, P> {
     }
 }
 
-#[derive(Clone)]
-pub enum Engine {
-    Dtac(Arc<DtacCache<String, bytes::Bytes>>),
-    Lru(Arc<BaselineLruEngine<String, bytes::Bytes>>),
-}
+impl BenchEngine for BaselineLruEngine<String, Bytes> {
+    fn name(&self) -> &'static str {
+        "lru"
+    }
 
-impl Engine {
-    /// The keys currently in the main cache. Locks every shard in turn.
-    pub fn resident_keys(&self) -> Vec<String> {
-        match self {
-            Self::Dtac(cache) => cache.engine().resident_keys(),
-            Self::Lru(lru) => lru.resident_keys(),
+    async fn access<R, F, Fut>(&self, key: String, _request: R, fetch: F) -> Outcome
+    where
+        R: FnOnce() -> RequestData + Send,
+        F: FnOnce(&String) -> Fut + Send,
+        Fut: Future<Output = Bytes> + Send,
+    {
+        Self::access(self, key, fetch).await;
+        Outcome::default()
+    }
+
+    fn resident_keys(&self) -> Vec<String> {
+        Self::resident_keys(self)
+    }
+
+    fn set_eviction_listener(&mut self, listener: EvictionListener<String>) {
+        Self::set_eviction_listener(self, listener);
+    }
+
+    fn structure(&self) -> Structure {
+        Structure {
+            shards: self.shards.len(),
+            main_entries: (0..self.shards.len()).map(|id| self.shard(id).len()).sum(),
+            ..Structure::default()
         }
     }
 }
@@ -113,6 +238,7 @@ mod tests {
     use super::*;
     use dtac::cache_engine::NUM_SHARDS;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[tokio::test]
@@ -161,8 +287,8 @@ mod tests {
         let ledger = Arc::new(Ledger::default());
         ledger.start_measuring();
         let listener_ledger = ledger.clone();
-        let engine = BaselineLruEngine::<String, i32>::new(2 * NUM_SHARDS, NUM_SHARDS)
-            .with_eviction_listener(Arc::new(move |key: &String| listener_ledger.on_evict(key)));
+        let mut engine = BaselineLruEngine::<String, i32>::new(2 * NUM_SHARDS, NUM_SHARDS);
+        engine.set_eviction_listener(Arc::new(move |key: &String| listener_ledger.on_evict(key)));
         let (human_key, bot_key, later_key) = three_colliding_keys();
 
         // Fetch as the bench does: the admitter is the label of the request that fetched.

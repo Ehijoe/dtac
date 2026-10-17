@@ -69,6 +69,12 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
         &self.engine
     }
 
+    /// Calls `listener` with every key evicted from the main cache, replacing any
+    /// listener set with [`DtacCacheBuilder::eviction_listener`].
+    pub fn set_eviction_listener(&mut self, listener: EvictionListener<K>) {
+        self.engine.set_eviction_listener(listener);
+    }
+
     /// The router that scores requests for this cache.
     pub const fn router(&self) -> &HeuristicRouter {
         &self.router

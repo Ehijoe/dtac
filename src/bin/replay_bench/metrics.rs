@@ -1,6 +1,5 @@
 //! Counters collected during a replay and the final report.
 
-use crate::Algorithm;
 use crate::classifier::{ClassifierReport, Sample};
 use crate::pollution::{Ledger, PollutionReport};
 use hdrhistogram::Histogram;
@@ -315,12 +314,14 @@ pub struct MemoryReport {
     /// bench's own bookkeeping (CPI ledger, classifier samples, histograms). Payloads are
     /// slices of one shared buffer and add almost nothing.
     pub rss_delta_bytes: Option<i64>,
+    /// Lock shards the capacity was split across.
+    pub shards: usize,
     pub main_entries: usize,
-    /// DTAC only.
+    /// Metadata-only entries: DTAC's ghost cache, S3FIFO's ghost queue.
     pub ghost_entries: Option<usize>,
-    /// DTAC only: the ghost-cache bound per shard.
+    /// The ghost bound per shard, where there is one.
     pub ghost_capacity_per_shard: Option<usize>,
-    /// DTAC only: IPs the router's `SpaceSaver` tracks.
+    /// Engines with a router: IPs its `SpaceSaver` tracks.
     pub tracked_ips: Option<usize>,
     /// Sum of `size_bytes` over the resident keys: what the payloads would cost if they
     /// weren't shared slices.
@@ -354,7 +355,10 @@ impl MemoryReport {
                 self.ghost_capacity_per_shard.unwrap_or_default()
             )
         });
-        println!("Cache entries:          {} main{ghost}", self.main_entries);
+        println!(
+            "Cache entries:          {} main{ghost}, {} shards",
+            self.main_entries, self.shards
+        );
         if let Some(ips) = self.tracked_ips {
             println!("SpaceSaver IPs:         {ips}");
         }
@@ -426,12 +430,13 @@ impl Report {
         }
     }
 
-    /// Prints the human-readable report.
-    pub fn print(&self, algorithm: Algorithm) {
+    /// Prints the human-readable report for the engine called `name`.
+    pub fn print(&self, name: &str) {
         let pct = |rate: f64| rate * 100.0;
-        let report_label = match algorithm {
-            Algorithm::Dtac => "DTAC",
-            Algorithm::Lru => "STANDARD LRU (BASELINE)",
+        let report_label = match name {
+            "dtac" => "DTAC".to_string(),
+            "lru" => "STANDARD LRU (BASELINE)".to_string(),
+            other => other.to_uppercase(),
         };
         let (human, bot, overall) = (&self.human, &self.bot, &self.overall);
         println!("\n========================================================");

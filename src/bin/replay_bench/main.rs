@@ -10,13 +10,13 @@ mod pollution;
 use clap::Parser;
 use classifier::{Label, Sample};
 use common::AsnArgs;
-use dtac::cache_engine::config::EngineConfig;
+use dtac::cache_engine::config::{EngineConfig, Shards};
 use dtac::clock::ManualClock;
 use dtac::dtac_cache::DtacCache;
 use dtac::heuristic_router::HeuristicRouter;
 use dtac::heuristic_router::config::RouterConfig;
 use dtac::types::RequestData;
-use engines::{BaselineLruEngine, Engine};
+use engines::{BaselineLruEngine, BenchEngine, DtacEngine};
 use indicatif::{ProgressBar, ProgressStyle};
 use metrics::{
     BenchMetrics, MemoryReport, Report, init_metrics, print_prometheus, proc_status_bytes,
@@ -36,7 +36,7 @@ use tokio::time::{Instant as TokioInstant, sleep_until};
 
 /// Which caching algorithm `replay_bench` drives the replayed log against.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Algorithm {
     /// DTAC's bot-aware randomized-eviction engine (the engine under test).
     Dtac,
@@ -108,6 +108,11 @@ struct Args {
     #[arg(long, value_name = "N")]
     ghost_multiplier: Option<usize>,
 
+    /// Number of lock shards, `auto` or a count, for every algorithm. Overrides
+    /// `shards` from `--engine-config`. `auto` keeps at least 64 entries per shard.
+    #[arg(long, value_name = "N|auto", value_parser = parse_shards)]
+    shards: Option<Shards>,
+
     /// Which caching algorithm to replay the log against. Run the tool
     /// twice, once per value, against the same log file to compare their
     /// hit rates.
@@ -145,6 +150,8 @@ struct RunInfo<'a> {
     file: &'a Path,
     algorithm: Algorithm,
     capacity: usize,
+    /// The resolved shard count the engine ran with.
+    shards: usize,
     concurrency: usize,
     payload_size: usize,
     speed: f64,
@@ -152,7 +159,7 @@ struct RunInfo<'a> {
     asn_db: &'a [PathBuf],
     /// Effective router config; `None` for engines without a router.
     router_config: Option<RouterConfig>,
-    /// Effective engine config; `None` for the baselines.
+    /// Effective engine config; `None` for engines other than DTAC's.
     engine_config: Option<EngineConfig>,
     /// The log's `.meta.json` sidecar (seed, ratio, generator arguments), if present.
     log_meta: Option<serde_json::Value>,
@@ -233,7 +240,20 @@ fn build_router(args: &Args) -> Result<HeuristicRouter, Box<dyn std::error::Erro
     Ok(HeuristicRouter::with_config(config, asn_db)?)
 }
 
-/// Builds the engine config from `--engine-config` and `--ghost-multiplier`.
+/// Parses `--shards`: `auto` or a positive count.
+fn parse_shards(raw: &str) -> Result<Shards, String> {
+    if raw.eq_ignore_ascii_case("auto") {
+        return Ok(Shards::Auto);
+    }
+    match raw.parse::<usize>() {
+        Ok(0) | Err(_) => Err(format!(
+            "expected `auto` or a positive integer, got {raw:?}"
+        )),
+        Ok(n) => Ok(Shards::Fixed(n)),
+    }
+}
+
+/// Builds the engine config from `--engine-config`, `--ghost-multiplier` and `--shards`.
 fn build_engine_config(args: &Args) -> Result<EngineConfig, Box<dyn std::error::Error>> {
     let mut config = match &args.engine_config {
         Some(path) => serde_json::from_reader(BufReader::new(File::open(path)?))?,
@@ -242,8 +262,18 @@ fn build_engine_config(args: &Args) -> Result<EngineConfig, Box<dyn std::error::
     if let Some(multiplier) = args.ghost_multiplier {
         config.ghost_multiplier = multiplier;
     }
-    println!("Engine config:  {}", serde_json::to_string(&config)?);
+    if let Some(shards) = args.shards {
+        config.shards = shards;
+    }
     Ok(config)
+}
+
+/// The shard count every algorithm uses: `--shards`, else the engine config's.
+fn shard_count(args: &Args) -> Result<usize, Box<dyn std::error::Error>> {
+    Ok(build_engine_config(args)?
+        .shards
+        .resolve(args.capacity)
+        .max(1))
 }
 
 /// Moves the simulated clock to a record's logged `timestamp` (in seconds).
@@ -317,8 +347,8 @@ struct LogRecord {
 }
 
 /// Shared state every replayed record needs.
-struct ReplayCtx {
-    engine: Engine,
+struct ReplayCtx<E> {
+    engine: E,
     log_clock: Option<Arc<ManualClock>>,
     metrics: Arc<BenchMetrics>,
     /// One zeroed buffer as large as the biggest payload. Each fetch returns a `slice`
@@ -328,7 +358,7 @@ struct ReplayCtx {
     default_size: u64,
 }
 
-impl ReplayCtx {
+impl<E> ReplayCtx<E> {
     /// The payload size for `record`: its `size_bytes`, or `--payload-size`.
     fn size_of(&self, record: &LogRecord) -> u64 {
         record.size_bytes.unwrap_or(self.default_size)
@@ -399,41 +429,27 @@ fn print_run_header(args: &Args, records: &[LogRecord]) {
     }
 }
 
-/// Builds the cache selected by `--algorithm`. For DTAC this prints the effective
-/// router and engine configs, and wires in `log_clock` when replaying on log time.
-/// Main-cache evictions are reported to `metrics`' ledger.
-fn build_engine(
+/// Builds DTAC's full pipeline, printing the effective router and engine configs, and
+/// wires in `log_clock` when replaying on log time.
+fn build_dtac(
     args: &Args,
     log_clock: Option<&Arc<ManualClock>>,
-    metrics: &Arc<BenchMetrics>,
-) -> Result<Engine, Box<dyn std::error::Error>> {
-    let metrics = metrics.clone();
-    let on_evict = Arc::new(move |key: &String| metrics.ledger.on_evict(key));
-    Ok(match args.algorithm {
-        Algorithm::Dtac => {
-            let mut builder = DtacCache::<String, bytes::Bytes>::builder(args.capacity)
-                .router(build_router(args)?)
-                .engine_config(build_engine_config(args)?)?
-                .eviction_listener(on_evict);
-            if let Some(clock) = log_clock {
-                builder = builder.clock(clock.clone());
-            }
-            Engine::Dtac(Arc::new(builder.build()))
-        }
-        Algorithm::Lru => {
-            let shards = build_engine_config(args)?.shards.resolve(args.capacity);
-            Engine::Lru(Arc::new(
-                BaselineLruEngine::<String, bytes::Bytes>::new(args.capacity, shards)
-                    .with_eviction_listener(on_evict),
-            ))
-        }
-    })
+) -> Result<DtacEngine, Box<dyn std::error::Error>> {
+    let engine_config = build_engine_config(args)?;
+    println!("Engine config:  {}", serde_json::to_string(&engine_config)?);
+    let mut builder = DtacCache::<String, bytes::Bytes>::builder(args.capacity)
+        .router(build_router(args)?)
+        .engine_config(engine_config)?;
+    if let Some(clock) = log_clock {
+        builder = builder.clock(clock.clone());
+    }
+    Ok(DtacEngine(builder.build()))
 }
 
 /// Replays one log record through the engine and records its outcome in the metrics.
 ///
 /// `seq` is the record's position in the log; it picks which latency stripe to record into.
-async fn replay_record(record: LogRecord, seq: usize, ctx: &ReplayCtx) {
+async fn replay_record<E: BenchEngine>(record: LogRecord, seq: usize, ctx: &ReplayCtx<E>) {
     let metrics = &ctx.metrics;
     let is_bot = record.traffic_type == "bot";
     let is_measurement = record.phase == Phase::Measurement;
@@ -446,7 +462,6 @@ async fn replay_record(record: LogRecord, seq: usize, ctx: &ReplayCtx) {
         metrics.record_request(is_bot, size);
     }
 
-    let path = record.path.clone();
     let key = record.path.clone();
     let origin = if is_bot { Origin::Bot } else { Origin::Human };
     let label = Label::of(
@@ -469,45 +484,35 @@ async fn replay_record(record: LogRecord, seq: usize, ctx: &ReplayCtx) {
         set_log_time(clock, record.timestamp);
     }
 
-    let req_start = Instant::now();
-    let phases = match &ctx.engine {
-        Engine::Dtac(cache) => {
-            // RequestData is only built for the Dtac arm -- the Lru
-            // baseline is bot-unaware by definition, so building it
-            // there would be pure overhead skewing the two
-            // algorithms' measured per-request latency against
-            // each other without affecting hit-rate correctness.
-            let req_data = RequestData {
-                ip_address: resolve_ip(&record.ip),
-                path: record.path,
-                method: record.method,
-                headers: record.headers,
-            };
-            let (_, stats) = cache
-                .access_with_stats(path, req_data, fetch_from_origin)
-                .await;
-            if is_measurement {
-                let sample = Sample {
-                    bot_prob: stats.bot_prob,
-                    label,
-                };
-                metrics.classifier.with(seq, |samples| samples.push(sample));
-            }
-            Some((stats.router_time, stats.engine_time))
-        }
-        Engine::Lru(baseline) => {
-            baseline.access(path, fetch_from_origin).await;
-            None
-        }
+    // Only engines with a router build the RequestData: for the bot-unaware baselines it
+    // would be pure overhead, skewing their measured latency without affecting hit rates.
+    let ip = record.ip;
+    let (path, method, headers) = (record.path, record.method, record.headers);
+    let request = move || RequestData {
+        ip_address: resolve_ip(&ip),
+        path,
+        method,
+        headers,
     };
+
+    let req_start = Instant::now();
+    let outcome = ctx
+        .engine
+        .access(key.clone(), request, fetch_from_origin)
+        .await;
     let total = req_start.elapsed();
     if is_measurement {
+        if let Some(bot_prob) = outcome.bot_prob {
+            let sample = Sample { bot_prob, label };
+            metrics.classifier.with(seq, |samples| samples.push(sample));
+        }
         metrics.total_duration_us.fetch_add(
             u64::try_from(total.as_micros()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        let (proxy, cache) =
-            phases.map_or((None, total), |(router, engine)| (Some(router), engine));
+        let (proxy, cache) = outcome
+            .phases
+            .map_or((None, total), |(router, engine)| (Some(router), engine));
         metrics.latency.with(seq, |h| h.record(proxy, cache, total));
     }
     if !is_bot {
@@ -542,9 +547,9 @@ fn progress_bar(quiet: bool, len: usize) -> Result<ProgressBar, Box<dyn std::err
 /// semaphore bounds how many may be in flight at once -- decoupling "when a request is
 /// paced to start" from "how many are concurrently executing," matching a real traffic
 /// replay.
-async fn dispatch(
+async fn dispatch<E: BenchEngine>(
     records: &[LogRecord],
-    ctx: &Arc<ReplayCtx>,
+    ctx: &Arc<ReplayCtx<E>>,
     args: &Args,
     pb: &ProgressBar,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
@@ -607,29 +612,26 @@ async fn dispatch(
 }
 
 /// Memory use at the end of the replay and the size of each structure.
-fn memory_report(engine: &Engine, rss_before_replay: Option<u64>, report: &Report) -> MemoryReport {
+fn memory_report(
+    engine: &impl BenchEngine,
+    rss_before_replay: Option<u64>,
+    report: &Report,
+) -> MemoryReport {
     let rss_after_replay = proc_status_bytes("VmRSS");
     let rss_delta = rss_before_replay
         .zip(rss_after_replay)
         .and_then(|(before, after)| Some(i64::try_from(after).ok()? - i64::try_from(before).ok()?));
-    let (main_entries, ghost_entries, ghost_capacity_per_shard, tracked_ips) = match engine {
-        Engine::Dtac(cache) => (
-            cache.engine().len(),
-            Some(cache.engine().ghost_len()),
-            Some(cache.engine().ghost_capacity_per_shard()),
-            Some(cache.router().tracked_ips()),
-        ),
-        Engine::Lru(_) => (engine.resident_keys().len(), None, None, None),
-    };
+    let structure = engine.structure();
     MemoryReport {
         peak_rss_bytes: proc_status_bytes("VmHWM"),
         rss_before_replay_bytes: rss_before_replay,
         rss_after_replay_bytes: rss_after_replay,
         rss_delta_bytes: rss_delta,
-        main_entries,
-        ghost_entries,
-        ghost_capacity_per_shard,
-        tracked_ips,
+        shards: structure.shards,
+        main_entries: structure.main_entries,
+        ghost_entries: structure.ghost_entries,
+        ghost_capacity_per_shard: structure.ghost_capacity_per_shard,
+        tracked_ips: structure.tracked_ips,
         logical_resident_bytes: report.pollution.as_ref().map(|p| p.resident_bytes_final),
     }
 }
@@ -638,21 +640,16 @@ fn memory_report(engine: &Engine, rss_before_replay: Option<u64>, report: &Repor
 fn write_json_out(
     path: &Path,
     args: &Args,
-    engine: &Engine,
+    engine: &impl BenchEngine,
     report: &Report,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (router_config, engine_config) = match engine {
-        Engine::Dtac(cache) => (
-            Some(*cache.router().config()),
-            Some(*cache.engine().config()),
-        ),
-        Engine::Lru(_) => (None, None),
-    };
+    let (router_config, engine_config) = engine.configs();
     let out = JsonOut {
         run: RunInfo {
             file: &args.file,
             algorithm: args.algorithm,
             capacity: args.capacity,
+            shards: engine.structure().shards,
             concurrency: args.concurrency,
             payload_size: args.payload_size,
             speed: args.speed,
@@ -670,6 +667,54 @@ fn write_json_out(
     Ok(())
 }
 
+/// Replays `records` through `engine` and prints (and optionally writes) the report.
+async fn run<E: BenchEngine>(
+    mut engine: E,
+    args: &Args,
+    records: Vec<LogRecord>,
+    log_clock: Option<Arc<ManualClock>>,
+    registry: &prometheus::Registry,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let engine_name = engine.name();
+    println!("Shards:         {}", engine.structure().shards);
+    let metrics = Arc::new(BenchMetrics::default());
+    let ledger_metrics = metrics.clone();
+    engine.set_eviction_listener(Arc::new(move |key: &String| {
+        ledger_metrics.ledger.on_evict(key);
+    }));
+
+    let default_size = args.payload_size as u64;
+    let max_size = records
+        .iter()
+        .filter_map(|r| r.size_bytes)
+        .fold(default_size, u64::max);
+    let ctx = Arc::new(ReplayCtx {
+        engine,
+        log_clock,
+        metrics,
+        payload: bytes::Bytes::from(vec![0u8; usize::try_from(max_size)?]),
+        default_size,
+    });
+
+    // Replay
+    let pb = progress_bar(args.quiet, records.len())?;
+    let rss_before_replay = proc_status_bytes("VmRSS");
+    let total_wall_time = dispatch(&records, &ctx, args, &pb).await?;
+
+    // Gather and compute final statistics
+    let mut report = Report::new(&ctx.metrics, total_wall_time);
+    report.memory = Some(memory_report(&ctx.engine, rss_before_replay, &report));
+    drop(records); // only now, so the log stays resident across both RSS readings
+    report.print(engine_name);
+    if !args.quiet {
+        print_prometheus(registry);
+    }
+    if let Some(path) = &args.json_out {
+        write_json_out(path, args, &ctx.engine, &report)?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -683,48 +728,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     init_tracing_if_requested();
 
-    // 1. Initialize Prometheus & OpenTelemetry Registry
+    // Prometheus & OpenTelemetry registry
     let registry = init_metrics()?;
 
-    // 2. Load NDJSON records into memory
+    // Load NDJSON records into memory
     let records = load_records(&args.file)?;
     println!("Loaded {} records into memory.", records.len());
     print_run_header(&args, &records);
 
-    // 3. Initialize Cache & Metrics Tracker
     let log_clock = (args.clock == ClockMode::Log).then(|| Arc::new(ManualClock::new(0)));
-    let default_size = args.payload_size as u64;
-    let max_size = records
-        .iter()
-        .filter_map(|r| r.size_bytes)
-        .fold(default_size, u64::max);
-    let metrics = Arc::new(BenchMetrics::default());
-    let ctx = Arc::new(ReplayCtx {
-        engine: build_engine(&args, log_clock.as_ref(), &metrics)?,
-        log_clock,
-        metrics,
-        payload: bytes::Bytes::from(vec![0u8; usize::try_from(max_size)?]),
-        default_size,
-    });
-
-    // 4. Replay
-    let pb = progress_bar(args.quiet, records.len())?;
-    let rss_before_replay = proc_status_bytes("VmRSS");
-    let total_wall_time = dispatch(&records, &ctx, &args, &pb).await?;
-
-    // 5. Gather and compute final statistics
-    let mut report = Report::new(&ctx.metrics, total_wall_time);
-    report.memory = Some(memory_report(&ctx.engine, rss_before_replay, &report));
-    drop(records); // only now, so the log stays resident across both RSS readings
-    report.print(args.algorithm);
-    if !args.quiet {
-        print_prometheus(&registry);
+    match args.algorithm {
+        Algorithm::Dtac => {
+            let engine = build_dtac(&args, log_clock.as_ref())?;
+            run(engine, &args, records, log_clock, &registry).await
+        }
+        Algorithm::Lru => {
+            let engine = BaselineLruEngine::new(args.capacity, shard_count(&args)?);
+            run(engine, &args, records, log_clock, &registry).await
+        }
     }
-    if let Some(path) = &args.json_out {
-        write_json_out(path, &args, &ctx.engine, &report)?;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
