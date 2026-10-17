@@ -172,7 +172,7 @@ mod tests {
         // A and C have been hit since insertion.
         let mut shard = SieveShard::new(4);
         for key in ['A', 'B', 'C', 'D'] {
-            assert!(request(&mut shard, key).is_empty());
+            assert_eq!(request(&mut shard, key), Vec::<char>::new());
         }
         request(&mut shard, 'A');
         request(&mut shard, 'C');
@@ -251,7 +251,7 @@ mod tests {
     fn reinserting_a_resident_key_is_a_no_op() {
         let mut shard = SieveShard::new(2);
         insert(&mut shard, 'A');
-        assert!(insert(&mut shard, 'A').is_empty());
+        assert_eq!(insert(&mut shard, 'A'), Vec::<char>::new());
         assert_eq!(shard.queue(), vec!['A']);
     }
 }

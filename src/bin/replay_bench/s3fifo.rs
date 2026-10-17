@@ -363,7 +363,7 @@ mod tests {
         let mut evicted = Vec::new();
         shard.insert(1, (), &mut evicted);
         shard.insert(1, (), &mut evicted);
-        assert!(evicted.is_empty());
+        assert_eq!(evicted, Vec::<i32>::new());
         assert_eq!(shard.small.len(), 1);
     }
 }
