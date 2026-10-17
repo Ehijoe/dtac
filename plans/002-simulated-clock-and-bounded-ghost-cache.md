@@ -1,6 +1,6 @@
 # Plan 002 — Log-timestamp clock + bounded ghost cache + configurable time constants
 
-**Status:** not started
+**Status:** done (branch `feat/002-simulated-clock-and-bounded-ghost-cache`)
 **Depends on:** 001, which introduces the `DtacCache` builder and `RouterConfig` that this plan extends.
 Do this before 003/004, because it changes what the benchmark numbers mean.
 

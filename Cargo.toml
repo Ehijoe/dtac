@@ -2,6 +2,10 @@
 name = "dtac"
 version = "0.1.0"
 edition = "2024"
+description = "Dynamic Traffic-Aware Cache: an HTTP cache that favors human traffic over bots using a heuristic bot score"
+repository = "https://github.com/Ehijoe/dtac"
+# Thesis project, not meant for crates.io; this also exempts it from clippy::cargo_common_metadata.
+publish = false
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -24,6 +28,9 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 # Allowed exceptions that override the 'pedantic' group
+# Duplicate versions come from transitive dependencies (e.g. axum 0.6 via
+# opentelemetry-prometheus next to our axum 0.8) and can't be fixed from this crate.
+multiple_crate_versions = "allow"
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 must_use_candidate = "allow"
@@ -61,3 +68,5 @@ serde_json = "1.0.151"
 # Used only by src/bin/replay_bench.rs to build a standard, bot-unaware
 # sharded LRU cache as a comparison baseline against DTAC's own engine.
 lru = "0.12"
+# Used only by replay_bench to record T_proxy / T_cache latency percentiles.
+hdrhistogram = { version = "7", default-features = false }

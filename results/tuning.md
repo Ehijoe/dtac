@@ -1,0 +1,417 @@
+# Calibration (plan 004, part 0)
+
+The router and engine constants were chosen here, on **seed 0**, before any evaluation
+run. Seeds 1–5, which every reported result uses, played no part in choosing them, and
+`run_experiments.py` refuses to run them until this file exists and never aggregates
+seed 0. The calibrated values are now the `RouterConfig` and `EngineConfig` defaults.
+They are fitted to the synthetic generator, not to real traffic. Reproduce them with
+`python scripts/run_experiments.py tune` (about 25 minutes; the generated section below is
+rewritten and this text is kept).
+
+## Reasoning for each choice
+
+Router, judged by the class-mean gap with returning-visitor FPR ≤ 5%:
+
+- **`prior_bot_rate` 0.1 → 0.02.** Once the weights push naive bots close to 1, the gap is
+  roughly `1 − prior`, so the lowest prior in the grid wins (0.9657 at 0.02 against
+  0.8960 at 0.1). The grid stops at 0.02 on purpose. The prior is an assumed base rate,
+  and below about 2% a clean human's per-hit increment `1 − bot_prob` (0.98) is already
+  almost the maximum, so the engine gains nothing from going lower. In the first pass,
+  0.3 broke the FPR limit (returning visitors scored above 0.5 once "Shy Guys" fired).
+- **`w_hdr` 1 → 4** (top of the grid). On this generator every naive bot omits
+  `Accept-Language` and no human does, so the header weight only adds separation. It is
+  the most circular choice here: real browsers and real bots don't split this cleanly.
+- **`w_fav` 1.2 → 2.** "Shy Guys" fires on about 2.3% of human requests (returning
+  visitors past the page threshold). With the low prior, a weight of 2 still keeps them
+  under 0.5 (0% FPR), and 3 gains nothing.
+- **`w_asn` 1.5 → 3.** 4 was within the tolerance of 3, so the smaller change was kept.
+- **`velocity_tick_ms` 1000 → 5000, `burst_threshold` 10 → 3.** Swept jointly. On log
+  time, 1 s ticks never flag the naive bots' 3.6 req/s (their EWMA settles near 7). 5 s
+  ticks with threshold 3 flag nearly all of them. The cost: velocity now fires on about
+  4.2% of human requests (fast multi-page sessions), though never enough on its own to
+  cross 0.5.
+- **`shy_page_threshold` 5 → 12** (top of the grid). A longer grace period flags fewer
+  returning visitors, and the naive bots, which never fetch assets, get past 12 pages
+  quickly anyway.
+- `alpha`, `velocity_reset_ticks` and `space_saver_half_life_s` were not swept and keep
+  their defaults.
+
+Engine, judged by human hit rate with the router fixed:
+
+- **`decay_half_life_ms` 1 s → 4 h** (top of the grid). This is the change that matters:
+  at 1 s a score halves between two page views of a session, so few items ever reach the
+  promotion threshold, and the main cache held 25–130 of its 10 000 slots. Hit rate rises
+  with every step of the grid, and the last step (1 h → 4 h) adds only 0.15 points. A
+  4 h half-life is longer than the 3.3 h log, so the policy becomes close to LFU with
+  LRU tie-breaks. That suits this generator because its Zipf popularity is
+  **stationary**. A workload whose popular set drifts would want a much shorter
+  half-life, and these results say nothing about that case.
+- **`promotion_threshold` 2 → 1.5.** With human increments of 0.98, 1.5 means "promote
+  on the second human request". 1.0 tied with it within the tolerance, so the smaller
+  change was kept. 0.5 (promote on the first human request) is worse at 10 000 because
+  one-off human requests then compete with popular items.
+- **`n_samples` 5 → 8.** Small but consistent gain over 5. 14 was within the tolerance.
+  For thesis row #11 (which derives N = 14), the difference between 8 and 14 is
+  0.03 points on this workload.
+- **`ghost_multiplier` 4 → 8.** A slightly longer ghost memory helps (+0.06 points), and
+  any multiplier of 2 or more beats 1 by about 1.5 points.
+
+**The capacity check flags one value.** At capacity 20 000 a promotion threshold of 0.5 is
+2.3 points better than the calibrated 1.5: with more room, admitting on the first human
+request pays off. At 1 000 the opposite holds (3 is 0.9 points better). Per plan 004 the
+constants are *not* re-tuned per capacity, so the capacity sweep runs every capacity with
+the 10 000-calibrated values. At 20 000, DTAC is therefore measured with a threshold that
+is known to be about 2 points short of its best there.
+
+**On the empirical LLRs below.** They are reported because the thesis describes the
+weights as `ln(P(E|bot)/P(E|human))`, but they are **circular**: the generator was written
+to trigger exactly these heuristics, so its bots fire them almost always and its humans
+almost never. Header and ASN LLRs of +12 only restate how the synthetic bots were built.
+They do not validate the weights. The calibrated weights are much smaller than the LLRs
+because a Naive-Bayes sum of +12-scale terms would saturate every bot at 1 and every
+weight change would stop mattering. The weights are tuned for separation under the
+FPR constraint, not estimated as likelihood ratios.
+
+<!-- generated by run_experiments.py tune: start -->
+
+## Setup
+
+- Tuning seed **0** (evaluation seeds are 1–5), naive workload only, bot ratios 30%, 75%, capacity 10,000, `--algorithm dtac`, ASN fixture loaded.
+- Router stage: maximise the mean class-mean gap (`mean_bot_prob_bot − mean_bot_prob_human`) subject to a returning-visitor FPR (at 0.5) of at most 5% at every ratio. Engine stage, with the router fixed: maximise the mean human hit rate. The stages run one after the other, not jointly.
+- Coordinate descent: each group is swept with every other parameter held at its current value, coarse grid first, then midpoints around each chosen value. A value replaces the current one only if it is more than 0.001 (gap) / 0.05 points (hit rate) better; among the values within that tolerance of the best, the one nearest the current value is kept.
+
+## Chosen values
+
+| Parameter | Part | Old default | Calibrated |
+|---|---|---|---|
+| `prior_bot_rate` | router | 0.1 | **0.02** |
+| `w_asn` | router | 1.5 | **3** |
+| `w_fav` | router | 1.2 | **2** |
+| `w_hdr` | router | 1 | **4** |
+| `burst_threshold` | router | 10 | **3** |
+| `shy_page_threshold` | router | 5 | **12** |
+| `velocity_tick_ms` | router | 1000 | **5000** |
+| `decay_half_life_ms` | engine | 1000 | **14400000** |
+| `promotion_threshold` | engine | 2 | **1.5** |
+| `n_samples` | engine | 5 | **8** |
+| `ghost_multiplier` | engine | 4 | **8** |
+
+- Router: class-mean gap 0.976, worst returning-visitor FPR 0.00%, mean AUC 1.0000.
+- Engine: mean human hit rate 58.38% over 30%, 75%.
+
+## Empirical log-likelihood ratios (circular — not validation)
+
+`ln(P(fired | bot) / P(fired | human))` per heuristic on the tuning seed under the calibrated config, with Haldane's +0.5 correction. The generator was written to trigger exactly these heuristics, so these numbers only restate how the synthetic bots were built; they say nothing about real traffic.
+
+| Bot ratio | Heuristic | Fires on humans | Fires on bots | Empirical LLR | Calibrated weight |
+|---|---|---|---|---|---|
+| 30% | velocity | 4.22% | 99.99% | +3.17 | `alpha` = 2 |
+| 30% | datacenter_asn | 0.00% | 49.94% | +11.52 | `w_asn` = 3 |
+| 30% | missing_assets | 2.28% | 99.95% | +3.78 | `w_fav` = 2 |
+| 30% | missing_accept_language | 0.00% | 100.00% | +12.21 | `w_hdr` = 4 |
+| 75% | velocity | 4.25% | 99.99% | +3.16 | `alpha` = 2 |
+| 75% | datacenter_asn | 0.00% | 63.64% | +11.76 | `w_asn` = 3 |
+| 75% | missing_assets | 2.27% | 99.96% | +3.78 | `w_fav` = 2 |
+| 75% | missing_accept_language | 0.00% | 100.00% | +12.21 | `w_hdr` = 4 |
+
+## Router sweeps
+
+### prior_bot_rate — coarse 1
+
+| `prior_bot_rate` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 0.02 | 0.2789 | 0.3194 | 0.2992 | 0.00% | 1.0000 |  |
+| 0.05 | 0.4398 | 0.4891 | 0.4645 | 0.00% | 1.0000 |  |
+| 0.1 | 0.5395 | 0.5836 | 0.5615 | 0.00% | 1.0000 |  |
+| 0.2 | 0.5721 | 0.6024 | 0.5872 | 0.00% | 1.0000 | **chosen** |
+| 0.3 | 0.5366 | 0.5584 | 0.5475 | 40.68% ✗ | 1.0000 |  |
+
+### w_hdr — coarse 1
+
+| `w_hdr` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 0.5 | 0.4899 | 0.5287 | 0.5093 | 0.00% | 1.0000 |  |
+| 1 | 0.5721 | 0.6024 | 0.5872 | 0.00% | 1.0000 |  |
+| 2 | 0.6832 | 0.6983 | 0.6908 | 0.00% | 1.0000 |  |
+| 3 | 0.7361 | 0.7429 | 0.7395 | 0.00% | 1.0000 |  |
+| 4 | 0.7578 | 0.7605 | 0.7591 | 0.00% | 1.0000 | **chosen** |
+
+### w_fav — coarse 1
+
+| `w_fav` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 0.5 | 0.7632 | 0.7680 | 0.7656 | 0.00% | 1.0000 | **chosen** |
+| 1.2 | 0.7578 | 0.7605 | 0.7591 | 0.00% | 1.0000 |  |
+| 2 | 0.7426 | 0.7441 | 0.7433 | 40.70% ✗ | 1.0000 |  |
+| 3 | 0.7256 | 0.7270 | 0.7263 | 40.70% ✗ | 1.0000 |  |
+
+### w_asn — coarse 1
+
+| `w_asn` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 0.75 | 0.7581 | 0.7612 | 0.7596 | 0.00% | 1.0000 |  |
+| 1.5 | 0.7632 | 0.7680 | 0.7656 | 0.00% | 1.0000 |  |
+| 3 | 0.7671 | 0.7727 | 0.7699 | 0.00% | 1.0000 | **chosen** |
+| 4 | 0.7679 | 0.7737 | 0.7708 | 0.00% | 1.0000 | best (within tolerance of chosen) |
+
+### velocity — coarse 1
+
+| `velocity_tick_ms` | `burst_threshold` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|---|
+| 1000 | 3 | 0.7811 | 0.7842 | 0.7826 | 0.00% | 1.0000 |  |
+| 1000 | 5 | 0.7718 | 0.7768 | 0.7743 | 0.00% | 1.0000 |  |
+| 1000 | 10 | 0.7671 | 0.7727 | 0.7699 | 0.00% | 1.0000 |  |
+| 2000 | 3 | 0.7860 | 0.7879 | 0.7869 | 0.00% | 1.0000 |  |
+| 2000 | 5 | 0.7816 | 0.7855 | 0.7835 | 0.00% | 1.0000 |  |
+| 2000 | 10 | 0.7704 | 0.7760 | 0.7732 | 0.00% | 1.0000 |  |
+| 5000 | 3 | 0.7860 | 0.7866 | 0.7863 | 0.12% | 1.0000 |  |
+| 5000 | 5 | 0.7878 | 0.7889 | 0.7883 | 0.00% | 1.0000 | **chosen** |
+| 5000 | 10 | 0.7832 | 0.7869 | 0.7850 | 0.00% | 1.0000 |  |
+
+### shy_page_threshold — coarse 1
+
+| `shy_page_threshold` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 3 | 0.7817 | 0.7831 | 0.7824 | 0.00% | 1.0000 |  |
+| 5 | 0.7878 | 0.7889 | 0.7883 | 0.00% | 1.0000 |  |
+| 8 | 0.7929 | 0.7941 | 0.7935 | 0.00% | 1.0000 |  |
+| 12 | 0.7962 | 0.7972 | 0.7967 | 0.00% | 1.0000 | **chosen** |
+
+### prior_bot_rate — coarse 2
+
+| `prior_bot_rate` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 0.02 | 0.9602 | 0.9711 | 0.9657 | 0.00% | 1.0000 | **chosen** |
+| 0.05 | 0.9415 | 0.9459 | 0.9437 | 0.00% | 1.0000 |  |
+| 0.1 | 0.8949 | 0.8971 | 0.8960 | 0.00% | 1.0000 |  |
+| 0.2 | 0.7962 | 0.7972 | 0.7967 | 0.00% | 1.0000 |  |
+| 0.3 | 0.6964 | 0.6970 | 0.6967 | 0.00% | 1.0000 |  |
+
+### w_hdr — coarse 2
+
+| `w_hdr` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 0.5 | 0.7001 | 0.8096 | 0.7548 | 0.00% | 1.0000 |  |
+| 1 | 0.7546 | 0.8559 | 0.8053 | 0.00% | 1.0000 |  |
+| 2 | 0.8694 | 0.9244 | 0.8969 | 0.00% | 1.0000 |  |
+| 3 | 0.9306 | 0.9573 | 0.9439 | 0.00% | 1.0000 |  |
+| 4 | 0.9602 | 0.9711 | 0.9657 | 0.00% | 1.0000 | **chosen** |
+
+### w_fav — coarse 2
+
+| `w_fav` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 0.5 | 0.9602 | 0.9711 | 0.9657 | 0.00% | 1.0000 |  |
+| 1.2 | 0.9688 | 0.9747 | 0.9717 | 0.00% | 1.0000 |  |
+| 2 | 0.9728 | 0.9755 | 0.9742 | 0.00% | 1.0000 | **chosen** |
+| 3 | 0.9720 | 0.9730 | 0.9725 | 0.00% | 1.0000 |  |
+
+### w_asn — coarse 2
+
+| `w_asn` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 0.75 | 0.9709 | 0.9741 | 0.9725 | 0.00% | 1.0000 |  |
+| 1.5 | 0.9722 | 0.9750 | 0.9736 | 0.00% | 1.0000 |  |
+| 3 | 0.9728 | 0.9755 | 0.9742 | 0.00% | 1.0000 | **chosen** |
+| 4 | 0.9729 | 0.9756 | 0.9742 | 0.00% | 1.0000 | best (within tolerance of chosen) |
+
+### velocity — coarse 2
+
+| `velocity_tick_ms` | `burst_threshold` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|---|
+| 1000 | 3 | 0.9563 | 0.9631 | 0.9597 | 0.00% | 1.0000 |  |
+| 1000 | 5 | 0.9322 | 0.9441 | 0.9382 | 0.00% | 1.0000 |  |
+| 1000 | 10 | 0.9201 | 0.9342 | 0.9272 | 0.00% | 1.0000 |  |
+| 2000 | 3 | 0.9688 | 0.9733 | 0.9710 | 0.00% | 1.0000 |  |
+| 2000 | 5 | 0.9576 | 0.9662 | 0.9619 | 0.00% | 1.0000 |  |
+| 2000 | 10 | 0.9283 | 0.9421 | 0.9352 | 0.00% | 1.0000 |  |
+| 5000 | 3 | 0.9752 | 0.9763 | 0.9757 | 0.00% | 1.0000 | **chosen** |
+| 5000 | 5 | 0.9728 | 0.9755 | 0.9742 | 0.00% | 1.0000 |  |
+| 5000 | 10 | 0.9607 | 0.9698 | 0.9652 | 0.00% | 1.0000 |  |
+
+### shy_page_threshold — coarse 2
+
+| `shy_page_threshold` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 3 | 0.9573 | 0.9588 | 0.9581 | 0.00% | 1.0000 |  |
+| 5 | 0.9648 | 0.9661 | 0.9654 | 0.00% | 1.0000 |  |
+| 8 | 0.9713 | 0.9724 | 0.9719 | 0.00% | 1.0000 |  |
+| 12 | 0.9752 | 0.9763 | 0.9757 | 0.00% | 1.0000 | **chosen** |
+
+### prior_bot_rate (refine prior_bot_rate) — refine
+
+| `prior_bot_rate` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 0.02 | 0.9752 | 0.9763 | 0.9757 | 0.00% | 1.0000 | **chosen** |
+| 0.035 | 0.9592 | 0.9599 | 0.9595 | 0.00% | 1.0000 |  |
+
+### w_hdr (refine w_hdr) — refine
+
+| `w_hdr` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 3.5 | 0.9742 | 0.9758 | 0.9750 | 0.00% | 1.0000 |  |
+| 4 | 0.9752 | 0.9763 | 0.9757 | 0.00% | 1.0000 | **chosen** |
+
+### w_fav (refine w_fav) — refine
+
+| `w_fav` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 1.6 | 0.9752 | 0.9768 | 0.9760 | 0.00% | 1.0000 | best (within tolerance of chosen) |
+| 2 | 0.9752 | 0.9763 | 0.9757 | 0.00% | 1.0000 | **chosen** |
+| 2.5 | 0.9742 | 0.9750 | 0.9746 | 0.00% | 1.0000 |  |
+
+### w_asn (refine w_asn) — refine
+
+| `w_asn` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 2.25 | 0.9751 | 0.9762 | 0.9756 | 0.00% | 1.0000 |  |
+| 3 | 0.9752 | 0.9763 | 0.9757 | 0.00% | 1.0000 | **chosen** |
+| 3.5 | 0.9752 | 0.9763 | 0.9758 | 0.00% | 1.0000 | best (within tolerance of chosen) |
+
+### velocity (refine velocity_tick_ms) — refine
+
+| `velocity_tick_ms` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 3500 | 0.9738 | 0.9758 | 0.9748 | 0.00% | 1.0000 |  |
+| 5000 | 0.9752 | 0.9763 | 0.9757 | 0.00% | 1.0000 | **chosen** |
+
+### velocity (refine burst_threshold) — refine
+
+| `burst_threshold` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 3 | 0.9752 | 0.9763 | 0.9757 | 0.00% | 1.0000 | **chosen** |
+| 4 | 0.9744 | 0.9762 | 0.9753 | 0.00% | 1.0000 |  |
+
+### shy_page_threshold (refine shy_page_threshold) — refine
+
+| `shy_page_threshold` | gap 30% | gap 75% | mean gap | worst FPR ret. | AUC |  |
+|---|---|---|---|---|---|---|
+| 10 | 0.9737 | 0.9748 | 0.9742 | 0.00% | 1.0000 |  |
+| 12 | 0.9752 | 0.9763 | 0.9757 | 0.00% | 1.0000 | **chosen** |
+
+## Engine sweeps (router fixed at the calibrated values)
+
+### decay_half_life_ms — coarse 1
+
+| `decay_half_life_ms` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 1000 | 20.86 | 20.33 | 20.59 | 25 |  |
+| 10000 | 28.23 | 28.20 | 28.22 | 162 |  |
+| 60000 | 36.32 | 36.34 | 36.33 | 680 |  |
+| 300000 | 44.43 | 44.57 | 44.50 | 2236 |  |
+| 1800000 | 52.48 | 52.65 | 52.57 | 6617 |  |
+| 3600000 | 54.05 | 54.15 | 54.10 | 8174 |  |
+| 14400000 | 54.70 | 54.52 | 54.61 | 8966 | **chosen** |
+
+### promotion_threshold — coarse 1
+
+| `promotion_threshold` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 0.5 | 57.85 | 57.23 | 57.54 | 9984 |  |
+| 1 | 58.21 | 58.26 | 58.24 | 9984 | best (within tolerance of chosen) |
+| 1.5 | 58.24 | 58.18 | 58.21 | 9984 | **chosen** |
+| 2 | 54.70 | 54.52 | 54.61 | 8966 |  |
+| 3 | 50.45 | 50.37 | 50.41 | 5592 |  |
+
+### ghost_multiplier — coarse 1
+
+| `ghost_multiplier` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 1 | 56.97 | 56.12 | 56.55 | 9712 |  |
+| 2 | 58.23 | 58.16 | 58.20 | 9984 |  |
+| 4 | 58.24 | 58.18 | 58.21 | 9984 | **chosen** |
+| 8 | 58.27 | 58.20 | 58.24 | 9984 | best (within tolerance of chosen) |
+
+### n_samples — coarse 1
+
+| `n_samples` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 3 | 57.88 | 58.00 | 57.94 | 9984 |  |
+| 5 | 58.24 | 58.18 | 58.21 | 9984 |  |
+| 8 | 58.30 | 58.34 | 58.32 | 9984 | **chosen** |
+| 14 | 58.32 | 58.36 | 58.34 | 9984 | best (within tolerance of chosen) |
+
+### decay_half_life_ms — coarse 2
+
+| `decay_half_life_ms` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 1000 | 26.29 | 26.11 | 26.20 | 130 |  |
+| 10000 | 33.97 | 33.96 | 33.96 | 622 |  |
+| 60000 | 41.55 | 41.56 | 41.56 | 1803 |  |
+| 300000 | 49.38 | 49.49 | 49.44 | 4730 |  |
+| 1800000 | 57.09 | 57.19 | 57.14 | 9970 |  |
+| 3600000 | 58.16 | 58.18 | 58.17 | 9984 |  |
+| 14400000 | 58.30 | 58.34 | 58.32 | 9984 | **chosen** |
+
+### promotion_threshold — coarse 2
+
+| `promotion_threshold` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 0.5 | 58.16 | 57.84 | 58.00 | 9984 |  |
+| 1 | 58.30 | 58.35 | 58.32 | 9984 | best (within tolerance of chosen) |
+| 1.5 | 58.30 | 58.34 | 58.32 | 9984 | **chosen** |
+| 2 | 54.71 | 54.66 | 54.69 | 9102 |  |
+| 3 | 50.46 | 50.44 | 50.45 | 5640 |  |
+
+### ghost_multiplier — coarse 2
+
+| `ghost_multiplier` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 1 | 57.01 | 56.54 | 56.77 | 9863 |  |
+| 2 | 58.36 | 58.23 | 58.30 | 9984 |  |
+| 4 | 58.30 | 58.34 | 58.32 | 9984 |  |
+| 8 | 58.38 | 58.38 | 58.38 | 9984 | **chosen** |
+
+### n_samples — coarse 2
+
+| `n_samples` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 3 | 57.95 | 57.86 | 57.91 | 9984 |  |
+| 5 | 58.27 | 58.20 | 58.24 | 9984 |  |
+| 8 | 58.38 | 58.38 | 58.38 | 9984 | **chosen** |
+| 14 | 58.38 | 58.33 | 58.35 | 9984 |  |
+
+### decay_half_life_ms (refine decay_half_life_ms) — refine
+
+| `decay_half_life_ms` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 9000000 | 58.38 | 58.32 | 58.35 | 9984 |  |
+| 14400000 | 58.38 | 58.38 | 58.38 | 9984 | **chosen** |
+
+### promotion_threshold (refine promotion_threshold) — refine
+
+| `promotion_threshold` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 1.25 | 58.40 | 58.42 | 58.41 | 9984 | best (within tolerance of chosen) |
+| 1.5 | 58.38 | 58.38 | 58.38 | 9984 | **chosen** |
+| 1.75 | 58.32 | 58.37 | 58.34 | 9984 |  |
+
+### ghost_multiplier (refine ghost_multiplier) — refine
+
+| `ghost_multiplier` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 6 | 58.35 | 58.34 | 58.34 | 9984 |  |
+| 8 | 58.38 | 58.38 | 58.38 | 9984 | **chosen** |
+
+### n_samples (refine n_samples) — refine
+
+| `n_samples` | human HR 30% | human HR 75% | mean human HR | main entries |  |
+|---|---|---|---|---|---|
+| 6 | 58.27 | 58.31 | 58.29 | 9984 |  |
+| 8 | 58.38 | 58.38 | 58.38 | 9984 | **chosen** |
+| 11 | 58.34 | 58.36 | 58.35 | 9984 |  |
+
+## Check at the other capacities
+
+The capacity-sensitive engine groups re-swept at each other capacity of the sweep, with everything else at the calibrated values. Not re-tuned per capacity; this only checks the chosen values aren't badly off (flagged if more than 1 points behind that capacity's best).
+
+| Capacity | Group | Chosen: mean human HR | Best at this capacity | Best value | Flag |
+|---|---|---|---|---|---|
+| 1,000 | decay_half_life_ms | 39.28 | 39.60 | decay_half_life_ms=60000 | ok |
+| 1,000 | promotion_threshold | 39.28 | 40.19 | promotion_threshold=3 | ok |
+| 5,000 | decay_half_life_ms | 51.91 | 52.12 | decay_half_life_ms=3600000 | ok |
+| 5,000 | promotion_threshold | 51.91 | 52.29 | promotion_threshold=2 | ok |
+| 20,000 | decay_half_life_ms | 61.62 | 61.62 | decay_half_life_ms=14400000 | ok |
+| 20,000 | promotion_threshold | 61.62 | 63.89 | promotion_threshold=0.5 | ⚠ badly off |
+
+<!-- generated by run_experiments.py tune: end -->

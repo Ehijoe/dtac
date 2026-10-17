@@ -1,6 +1,6 @@
 # Plan 003 — Richer workloads + benchmark measurement
 
-**Status:** not started
+**Status:** done (branch `feat/003-workloads-and-benchmark-metrics`)
 **Depends on:**
 - 001, for the ASN fixture ranges (to keep humans out of them and to build the bot pool) and for
   `shy_page_threshold`.

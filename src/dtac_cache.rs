@@ -1,11 +1,17 @@
-use crate::cache_engine::DtacCacheEngine;
-use crate::heuristic_router::HeuristicRouter;
+use crate::cache_engine::config::EngineConfig;
+use crate::cache_engine::{DtacCacheEngine, EvictionListener};
+use crate::clock::Clock;
+use crate::error::Result;
+use crate::heuristic_router::{Evidence, HeuristicRouter};
 use crate::types::RequestData;
-use std::hash::Hash;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram};
-use std::time::Instant;
-use tracing::{info, debug};
+use std::fmt;
+use std::hash::Hash;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{debug, info};
 
 /// Combined DTAC component containing both the Cache Engine and Heuristic Router
 #[derive(Debug)]
@@ -18,24 +24,66 @@ pub struct DtacCache<K, P> {
 }
 
 impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
-    /// Creates a new `DtacCache` with specified cache capacity and SpaceSaver parameters.
+    /// Creates a new `DtacCache` with the given capacity and default components.
+    ///
+    /// Shorthand for `DtacCache::builder(capacity).build()`.
     pub fn new(capacity: usize) -> Self {
-        let meter = global::meter("dtac");
-        
-        Self {
-            engine: DtacCacheEngine::new(capacity),
-            router: HeuristicRouter::new(),
-            hits_counter: meter.u64_counter("dtac.cache.hits").with_description("Number of cache hits").init(),
-            misses_counter: meter.u64_counter("dtac.cache.misses").with_description("Number of cache misses").init(),
-            processing_time: meter.f64_histogram("dtac.request.duration").with_description("Processing time for a request in seconds").init(),
+        Self::builder(capacity).build()
+    }
+
+    /// Starts building a `DtacCache` with the given cache capacity.
+    pub fn builder(capacity: usize) -> DtacCacheBuilder<K, P> {
+        DtacCacheBuilder {
+            capacity,
+            router: None,
+            clock: None,
+            engine_config: EngineConfig::default(),
+            eviction_listener: None,
+            _types: PhantomData,
         }
+    }
+
+    fn from_parts(engine: DtacCacheEngine<K, P>, router: HeuristicRouter) -> Self {
+        let meter = global::meter("dtac");
+
+        Self {
+            engine,
+            router,
+            hits_counter: meter
+                .u64_counter("dtac.cache.hits")
+                .with_description("Number of cache hits")
+                .init(),
+            misses_counter: meter
+                .u64_counter("dtac.cache.misses")
+                .with_description("Number of cache misses")
+                .init(),
+            processing_time: meter
+                .f64_histogram("dtac.request.duration")
+                .with_description("Processing time for a request in seconds")
+                .init(),
+        }
+    }
+
+    /// The cache engine, e.g. to read its configuration or entry counts.
+    pub const fn engine(&self) -> &DtacCacheEngine<K, P> {
+        &self.engine
+    }
+
+    /// Calls `listener` with every key evicted from the main cache, replacing any
+    /// listener set with [`DtacCacheBuilder::eviction_listener`].
+    pub fn set_eviction_listener(&mut self, listener: EvictionListener<K>) {
+        self.engine.set_eviction_listener(listener);
+    }
+
+    /// The router that scores requests for this cache.
+    pub const fn router(&self) -> &HeuristicRouter {
+        &self.router
     }
 
     /// Accesses a resource from the cache.
     ///
     /// It first evaluates the request using the heuristic router to get a bot score,
     /// then calls the cache engine's `access` method.
-
     pub async fn access<F, Fut>(
         &self,
         requested_resource: K,
@@ -46,27 +94,55 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
         F: FnOnce(&K) -> Fut,
         Fut: Future<Output = P>,
     {
+        self.access_with_stats(requested_resource, request_data, fetch_from_origin)
+            .await
+            .0
+    }
+
+    /// Like [`access`](Self::access), but also returns what happened: whether it was a
+    /// hit, the request's bot probability and how long each phase took.
+    pub async fn access_with_stats<F, Fut>(
+        &self,
+        requested_resource: K,
+        request_data: RequestData,
+        fetch_from_origin: F,
+    ) -> (P, AccessStats)
+    where
+        F: FnOnce(&K) -> Fut,
+        Fut: Future<Output = P>,
+    {
         let start_time = Instant::now();
-        
+
         debug!("Processing request for resource");
 
-        // Calculate the score proxying for AI-Score
-        let request_bot_prob = match self.router.evaluate_request(&request_data).await {
-            Ok(score) => score.value() as f32,
-            Err(_) => 0.5, // fallback if evaluation fails
-        };
-        
+        // Calculate the score proxying for AI-Score; 0.5 is the fallback if evaluation fails.
+        // A probability in [0, 1] loses nothing that matters when narrowed to f32.
+        #[allow(clippy::cast_possible_truncation)]
+        let (request_bot_prob, evidence) = self
+            .router
+            .evaluate_request_detailed(&request_data)
+            .await
+            .map_or_else(
+                |_| (0.5, Evidence::default()),
+                |eval| (eval.score.value() as f32, eval.evidence),
+            );
+        let router_time = start_time.elapsed();
+
         // Track whether it was a hit or miss
         let mut was_hit = true;
-        
+
         // Use the score in the caching engine
-        let result = self.engine.access(requested_resource, request_bot_prob, |k| {
-            was_hit = false;
-            fetch_from_origin(k)
-        }).await;
-        
-        let duration = start_time.elapsed().as_secs_f64();
-        
+        let result = self
+            .engine
+            .access(requested_resource, request_bot_prob, |k| {
+                was_hit = false;
+                fetch_from_origin(k)
+            })
+            .await;
+
+        let total_time = start_time.elapsed();
+        let duration = total_time.as_secs_f64();
+
         if was_hit {
             self.hits_counter.add(1, &[]);
             debug!("Cache hit");
@@ -74,16 +150,117 @@ impl<K: Eq + Hash + Clone, P: Clone> DtacCache<K, P> {
             self.misses_counter.add(1, &[]);
             debug!("Cache miss");
         }
-        
+
         self.processing_time.record(duration, &[]);
-        
+
         info!(
             hit = was_hit,
             bot_prob = request_bot_prob,
             duration_sec = duration,
             "Request processed"
         );
-        
-        result
+
+        let stats = AccessStats {
+            hit: was_hit,
+            bot_prob: request_bot_prob,
+            evidence,
+            router_time,
+            engine_time: total_time.saturating_sub(router_time),
+        };
+        (result, stats)
+    }
+}
+
+/// What happened during one [`DtacCache::access_with_stats`] call.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AccessStats {
+    /// Whether the request was served without calling `fetch_from_origin`.
+    pub hit: bool,
+    /// The router's bot probability for the request, in `[0, 1]`.
+    pub bot_prob: f32,
+    /// Which of the router's heuristics fired.
+    pub evidence: Evidence,
+    /// Time spent scoring the request in the router (`T_proxy`).
+    pub router_time: Duration,
+    /// Time spent in the cache engine, including any origin fetch (`T_cache`).
+    pub engine_time: Duration,
+}
+
+/// Builder for [`DtacCache`], created by [`DtacCache::builder`].
+///
+/// Components that are not set explicitly use their defaults.
+pub struct DtacCacheBuilder<K, P> {
+    capacity: usize,
+    router: Option<HeuristicRouter>,
+    clock: Option<Arc<dyn Clock>>,
+    engine_config: EngineConfig,
+    eviction_listener: Option<EvictionListener<K>>,
+    // `fn() -> _` keeps the builder `Send + Sync` regardless of `K` and `P`.
+    _types: PhantomData<fn() -> (K, P)>,
+}
+
+impl<K, P> fmt::Debug for DtacCacheBuilder<K, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DtacCacheBuilder")
+            .field("capacity", &self.capacity)
+            .field("router", &self.router)
+            .field("clock", &self.clock)
+            .field("engine_config", &self.engine_config)
+            .field("eviction_listener", &self.eviction_listener.is_some())
+            .finish()
+    }
+}
+
+impl<K: Eq + Hash + Clone, P: Clone> DtacCacheBuilder<K, P> {
+    /// Uses `router` to score requests instead of [`HeuristicRouter::new`].
+    #[must_use]
+    pub fn router(mut self, router: HeuristicRouter) -> Self {
+        self.router = Some(router);
+        self
+    }
+
+    /// Makes both the router and the engine read time from `clock`.
+    ///
+    /// Without this, the engine uses the router's clock (the system clock unless the
+    /// router was given another with [`HeuristicRouter::with_clock`]).
+    #[must_use]
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Runs the cache engine with `config` instead of [`EngineConfig::default`].
+    ///
+    /// Fails with [`DTACError::ConfigError`](crate::error::DTACError::ConfigError) if
+    /// `config` does not pass [`EngineConfig::validate`].
+    pub fn engine_config(mut self, config: EngineConfig) -> Result<Self> {
+        config.validate()?;
+        self.engine_config = config;
+        Ok(self)
+    }
+
+    /// Calls `listener` with every key evicted from the main cache. See
+    /// [`DtacCacheEngine::with_eviction_listener`].
+    #[must_use]
+    pub fn eviction_listener(mut self, listener: EvictionListener<K>) -> Self {
+        self.eviction_listener = Some(listener);
+        self
+    }
+
+    /// Builds the cache. The router and the engine share one clock.
+    pub fn build(self) -> DtacCache<K, P> {
+        let mut router = self.router.unwrap_or_default();
+        let clock = match self.clock {
+            Some(clock) => {
+                router = router.with_clock(clock.clone());
+                clock
+            }
+            None => router.clock().clone(),
+        };
+        let mut engine = DtacCacheEngine::build(self.capacity, self.engine_config, clock);
+        if let Some(listener) = self.eviction_listener {
+            engine = engine.with_eviction_listener(listener);
+        }
+        DtacCache::from_parts(engine, router)
     }
 }
