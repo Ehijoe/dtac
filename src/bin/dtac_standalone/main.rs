@@ -1,5 +1,7 @@
 //! Standalone binary for running the DTAC cache engine as a proxy.
 
+mod client_ip;
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::{
@@ -10,6 +12,7 @@ use axum::{
     routing::{any, get},
 };
 use clap::Parser;
+use client_ip::Cidr;
 use common::AsnArgs;
 use dtac::dtac_cache::DtacCache;
 use dtac::heuristic_router::HeuristicRouter;
@@ -27,18 +30,6 @@ struct Args {
     #[arg(short = 'c', long, default_value_t = 1024)]
     capacity: usize,
 
-    /// The 'k' value for `SpaceSaver` sketch.
-    #[arg(short = 'k', long, default_value_t = 100)]
-    sketch_k: usize,
-
-    /// Depth for the Count-Min Sketch.
-    #[arg(short = 'd', long, default_value_t = 5)]
-    cm_depth: usize,
-
-    /// Width for the Count-Min Sketch.
-    #[arg(short = 'w', long, default_value_t = 2000)]
-    cm_width: usize,
-
     /// Upstream target URL to forward requests to
     #[arg(short = 't', long, default_value = "http://127.0.0.1:8081")]
     target: String,
@@ -47,18 +38,20 @@ struct Args {
     #[arg(short = 'p', long, default_value_t = 8080)]
     port: u16,
 
+    /// A reverse proxy (CIDR or single address) whose `X-Forwarded-For` header is
+    /// believed. Repeat for several. Without any, the TCP peer is always the client.
+    #[arg(long = "trusted-proxy", value_name = "CIDR")]
+    trusted_proxies: Vec<Cidr>,
+
     #[command(flatten)]
     asn: AsnArgs,
 }
 
 /// Handles a single proxied request.
 ///
-/// Uses the direct TCP peer address via `ConnectInfo`. Does not parse
-/// `X-Forwarded-For`/`X-Real-IP`; if DTAC is deployed behind a reverse proxy
-/// or load balancer, the observed IP will be the proxy's, not the end
-/// client's. Supporting forwarded-header parsing is a deliberate non-goal of
-/// this change -- it requires a trusted-proxy allowlist to avoid a
-/// trivially spoofable client IP, which is a separate piece of design work.
+/// The client IP is the TCP peer, or, when the peer is a `--trusted-proxy`, the
+/// right-most untrusted `X-Forwarded-For` hop (see [`client_ip::client_ip`]). The cache
+/// key is the path; the origin is asked for the path and query string.
 #[axum::debug_handler]
 async fn proxy_handler(
     State(state): State<AppState>,
@@ -66,6 +59,10 @@ async fn proxy_handler(
     req: Request,
 ) -> impl IntoResponse {
     let path = req.uri().path().to_string();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map_or_else(|| path.clone(), ToString::to_string);
     let method = req.method().to_string();
     let mut headers_map = std::collections::HashMap::new();
     for (k, v) in req.headers() {
@@ -74,7 +71,12 @@ async fn proxy_handler(
         }
     }
 
-    let ip_address = addr.ip();
+    let forwarded_for = req
+        .headers()
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok());
+    let ip_address = client_ip::client_ip(addr.ip(), forwarded_for, &state.trusted_proxies);
 
     let request_data = RequestData {
         ip_address,
@@ -83,16 +85,12 @@ async fn proxy_handler(
         headers: headers_map,
     };
 
-    let target = state.target.clone();
-
-    let fetch_from_origin = |key: &String| {
-        let url = format!("{target}{key}");
-        async move {
-            let client = reqwest::Client::new();
-            match client.get(&url).send().await {
-                Ok(resp) => resp.bytes().await.unwrap_or_default(),
-                Err(_) => bytes::Bytes::new(),
-            }
+    let url = format!("{}{path_and_query}", state.target);
+    let client = state.client.clone();
+    let fetch_from_origin = |_key: &String| async move {
+        match client.get(&url).send().await {
+            Ok(resp) => resp.bytes().await.unwrap_or_default(),
+            Err(_) => bytes::Bytes::new(),
         }
     };
 
@@ -106,6 +104,9 @@ async fn proxy_handler(
 struct AppState {
     cache: Arc<DtacCache<String, bytes::Bytes>>,
     target: String,
+    /// One pooled client for every origin fetch.
+    client: reqwest::Client,
+    trusted_proxies: Arc<[Cidr]>,
     registry: prometheus::Registry,
 }
 
@@ -164,9 +165,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let cache = Arc::new(DtacCache::builder(args.capacity).router(router).build());
+    if !args.trusted_proxies.is_empty() {
+        tracing::info!(trusted = ?args.trusted_proxies, "Believing X-Forwarded-For from these peers");
+    }
     let state = AppState {
         cache,
         target: args.target.clone(),
+        client: reqwest::Client::new(),
+        trusted_proxies: args.trusted_proxies.clone().into(),
         registry,
     };
 
