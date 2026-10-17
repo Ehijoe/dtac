@@ -10,13 +10,15 @@ mod pollution;
 use clap::Parser;
 use classifier::{Label, Sample};
 use common::AsnArgs;
+use dtac::cache_engine::DtacCacheEngine;
 use dtac::cache_engine::config::{EngineConfig, Shards};
 use dtac::clock::ManualClock;
+use dtac::clock::{Clock, SystemClock};
 use dtac::dtac_cache::DtacCache;
 use dtac::heuristic_router::HeuristicRouter;
 use dtac::heuristic_router::config::RouterConfig;
 use dtac::types::RequestData;
-use engines::{BaselineLruEngine, BenchEngine, DtacEngine};
+use engines::{BaselineLruEngine, BenchEngine, DtacEngine, NoScoreEngine};
 use indicatif::{ProgressBar, ProgressStyle};
 use metrics::{
     BenchMetrics, MemoryReport, Report, init_metrics, print_prometheus, proc_status_bytes,
@@ -40,6 +42,9 @@ use tokio::time::{Instant as TokioInstant, sleep_until};
 pub enum Algorithm {
     /// DTAC's bot-aware randomized-eviction engine (the engine under test).
     Dtac,
+    /// The ablation: DTAC's engine with every request scored as a clean human request
+    /// (`sigmoid(l_0)` of the router config), so the AI-score can't tell bots apart.
+    DtacNoScore,
     /// A standard, bot-unaware sharded LRU cache -- the baseline a
     /// `--algorithm lru` run is meant to be diffed against.
     Lru,
@@ -216,15 +221,22 @@ fn git_commit() -> Option<String> {
     })
 }
 
-/// Builds the router from `--router-config`, `--prior-bot-rate` and the ASN flags.
-fn build_router(args: &Args) -> Result<HeuristicRouter, Box<dyn std::error::Error>> {
-    let mut config = match &args.router_config {
+/// The router config from `--router-config` and `--prior-bot-rate`, validated.
+fn build_router_config(args: &Args) -> Result<RouterConfig, Box<dyn std::error::Error>> {
+    let mut config: RouterConfig = match &args.router_config {
         Some(path) => serde_json::from_reader(BufReader::new(File::open(path)?))?,
         None => RouterConfig::default(),
     };
     if let Some(prior) = args.prior_bot_rate {
         config.prior_bot_rate = prior;
     }
+    config.validate()?;
+    Ok(config)
+}
+
+/// Builds the router from `--router-config`, `--prior-bot-rate` and the ASN flags.
+fn build_router(args: &Args) -> Result<HeuristicRouter, Box<dyn std::error::Error>> {
+    let config = build_router_config(args)?;
 
     let asn_db = args.asn.load()?.unwrap_or_default();
     if !args.asn.asn_db.is_empty() {
@@ -444,6 +456,27 @@ fn build_dtac(
         builder = builder.clock(clock.clone());
     }
     Ok(DtacEngine(builder.build()))
+}
+
+/// Builds the ablation: DTAC's engine with the same config and clock as `build_dtac`,
+/// and a constant score derived from the router config.
+fn build_no_score(
+    args: &Args,
+    log_clock: Option<&Arc<ManualClock>>,
+) -> Result<NoScoreEngine, Box<dyn std::error::Error>> {
+    let engine_config = build_engine_config(args)?;
+    let router_config = build_router_config(args)?;
+    println!("Engine config:  {}", serde_json::to_string(&engine_config)?);
+    println!(
+        "Constant bot_prob: {} (a clean request under the router config)",
+        router_config.clean_request_bot_prob()
+    );
+    let clock: Arc<dyn Clock> = match log_clock {
+        Some(clock) => clock.clone(),
+        None => SystemClock::shared(),
+    };
+    let engine = DtacCacheEngine::with_config(args.capacity, engine_config, clock)?;
+    Ok(NoScoreEngine::new(engine, router_config))
 }
 
 /// Replays one log record through the engine and records its outcome in the metrics.
@@ -742,6 +775,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let engine = build_dtac(&args, log_clock.as_ref())?;
             run(engine, &args, records, log_clock, &registry).await
         }
+        Algorithm::DtacNoScore => {
+            let engine = build_no_score(&args, log_clock.as_ref())?;
+            run(engine, &args, records, log_clock, &registry).await
+        }
         Algorithm::Lru => {
             let engine = BaselineLruEngine::new(args.capacity, shard_count(&args)?);
             run(engine, &args, records, log_clock, &registry).await
@@ -844,6 +881,6 @@ mod tests {
         }
         while tasks.join_next().await.is_some() {}
 
-        assert_eq!(dtac::clock::Clock::now_millis(&*clock), 999 * 125);
+        assert_eq!(Clock::now_millis(&*clock), 999 * 125);
     }
 }

@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use dtac::cache_engine::config::EngineConfig;
-use dtac::cache_engine::{EvictionListener, shard_of};
+use dtac::cache_engine::{DtacCacheEngine, EvictionListener, shard_of};
 use dtac::dtac_cache::DtacCache;
 use dtac::heuristic_router::config::RouterConfig;
 use dtac::types::RequestData;
@@ -115,6 +115,74 @@ impl BenchEngine for DtacEngine {
             Some(*self.0.router().config()),
             Some(*self.0.engine().config()),
         )
+    }
+}
+
+/// The ablation: DTAC's engine (ghost admission and the decayed-score tournament) with
+/// every request given the same constant bot probability instead of a router score.
+///
+/// The constant is what a clean human request scores under the router config,
+/// `sigmoid(l_0)`, not 0. With 0 every request would add a full point and items would
+/// promote faster than in `dtac`, mixing a change in promotion speed into the comparison.
+/// With the human baseline, human traffic behaves exactly as in `dtac`, and the only
+/// difference is that bots are no longer told apart.
+pub struct NoScoreEngine {
+    engine: DtacCacheEngine<String, Bytes>,
+    bot_prob: f32,
+    router_config: RouterConfig,
+}
+
+impl NoScoreEngine {
+    /// Wraps `engine`, scoring every request as a clean request under `router_config`.
+    pub fn new(engine: DtacCacheEngine<String, Bytes>, router_config: RouterConfig) -> Self {
+        // A probability in [0, 1] loses nothing that matters when narrowed to f32, and
+        // DtacCache narrows the router's score the same way.
+        #[allow(clippy::cast_possible_truncation)]
+        let bot_prob = router_config.clean_request_bot_prob() as f32;
+        Self {
+            engine,
+            bot_prob,
+            router_config,
+        }
+    }
+}
+
+impl BenchEngine for NoScoreEngine {
+    fn name(&self) -> &'static str {
+        "dtac-no-score"
+    }
+
+    async fn access<R, F, Fut>(&self, key: String, _request: R, fetch: F) -> Outcome
+    where
+        R: FnOnce() -> RequestData + Send,
+        F: FnOnce(&String) -> Fut + Send,
+        Fut: Future<Output = Bytes> + Send,
+    {
+        self.engine.access(key, self.bot_prob, fetch).await;
+        Outcome::default()
+    }
+
+    fn resident_keys(&self) -> Vec<String> {
+        self.engine.resident_keys()
+    }
+
+    fn set_eviction_listener(&mut self, listener: EvictionListener<String>) {
+        self.engine.set_eviction_listener(listener);
+    }
+
+    fn structure(&self) -> Structure {
+        Structure {
+            shards: self.engine.shard_count(),
+            main_entries: self.engine.len(),
+            ghost_entries: Some(self.engine.ghost_len()),
+            ghost_capacity_per_shard: Some(self.engine.ghost_capacity_per_shard()),
+            tracked_ips: None,
+        }
+    }
+
+    /// The router config isn't used to score anything, but it fixes the constant.
+    fn configs(&self) -> (Option<RouterConfig>, Option<EngineConfig>) {
+        (Some(self.router_config), Some(*self.engine.config()))
     }
 }
 
@@ -263,6 +331,101 @@ mod tests {
             .await;
         assert_eq!(hit, 42);
         assert_eq!(fetches.load(Ordering::Relaxed), 1); // fetch not called again
+    }
+
+    /// Builds `dtac` and `dtac-no-score` with default configs on one shared clock.
+    fn dtac_and_ablation() -> (DtacEngine, NoScoreEngine, Arc<dtac::clock::ManualClock>) {
+        use dtac::clock::ManualClock;
+        use dtac::heuristic_router::HeuristicRouter;
+
+        let clock = Arc::new(ManualClock::new(0));
+        let dtac = DtacEngine(
+            DtacCache::builder(4_096)
+                .router(HeuristicRouter::new())
+                .clock(clock.clone())
+                .build(),
+        );
+        let engine =
+            DtacCacheEngine::with_config(4_096, EngineConfig::default(), clock.clone()).unwrap();
+        let ablation = NoScoreEngine::new(engine, RouterConfig::default());
+        (dtac, ablation, clock)
+    }
+
+    /// A clean human page view: browser headers, and an IP of its own so velocity and
+    /// "Shy Guys" never fire.
+    fn human_request(visitor: u32, path: &str) -> RequestData {
+        RequestData {
+            ip_address: std::net::IpAddr::V4(std::net::Ipv4Addr::from(0x1800_0000 + visitor)),
+            path: path.to_string(),
+            method: "GET".to_string(),
+            headers: HashMap::from([("accept-language".to_string(), "en-US".to_string())]),
+        }
+    }
+
+    #[tokio::test]
+    async fn ablation_promotes_the_same_keys_as_dtac_on_human_traffic() {
+        let (dtac, ablation, clock) = dtac_and_ablation();
+        let mut visitor = 0;
+        // 200 keys, each requested 1-4 times in quick succession: only some reach the
+        // promotion threshold, and the cache never fills, so no random eviction happens.
+        for i in 0..200_u32 {
+            let path = format!("/item/{i}");
+            for _ in 0..=(i % 4) {
+                visitor += 1;
+                clock.advance(Duration::from_millis(100));
+                let request = human_request(visitor, &path);
+                dtac.access(
+                    path.clone(),
+                    || request.clone(),
+                    |_k| async { Bytes::new() },
+                )
+                .await;
+                ablation
+                    .access(path.clone(), || request, |_k| async { Bytes::new() })
+                    .await;
+            }
+        }
+
+        let sorted = |mut keys: Vec<String>| {
+            keys.sort();
+            keys
+        };
+        let (dtac_keys, ablation_keys) = (
+            sorted(dtac.resident_keys()),
+            sorted(ablation.resident_keys()),
+        );
+        assert!(!dtac_keys.is_empty(), "the prefix should promote something");
+        assert!(
+            dtac_keys.len() < 200,
+            "and leave some keys in the ghost cache"
+        );
+        assert_eq!(dtac_keys, ablation_keys);
+    }
+
+    #[tokio::test]
+    async fn ablation_scores_bots_like_humans() {
+        let (_, ablation, _) = dtac_and_ablation();
+        let fetches = AtomicU64::new(0);
+        let fetch = |_k: &String| {
+            fetches.fetch_add(1, Ordering::Relaxed);
+            async { Bytes::new() }
+        };
+        let bot = || RequestData {
+            headers: HashMap::new(),
+            ..human_request(0, "/item/1")
+        };
+        // With the constant 0.1, three requests promote (3 x 0.9 >= 2) whoever sends them.
+        for _ in 0..3 {
+            ablation.access("/item/1".to_string(), bot, fetch).await;
+        }
+        assert_eq!(ablation.resident_keys(), vec!["/item/1".to_string()]);
+        let outcome = ablation.access("/item/1".to_string(), bot, fetch).await;
+        assert_eq!(
+            outcome,
+            Outcome::default(),
+            "no router, so no score or phases"
+        );
+        assert_eq!(fetches.load(Ordering::Relaxed), 3);
     }
 
     /// Three keys that hash to the same LRU shard.
