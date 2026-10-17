@@ -2,6 +2,11 @@
 
 benchmark_logs/
 
+# Per-run replay_bench JSON from scripts/run_experiments.py; only results/summary.* and
+# results/tuning.md are committed.
+results/raw/
+results/tuning_raw/
+
 # Full iptoasn.com downloads are large; only the small test fixture is committed.
 data/asn/*
 !data/asn/ip2asn-fixture.tsv

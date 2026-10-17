@@ -37,7 +37,7 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   python-test:
-    name: Log generator tests
+    name: Python script tests
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -50,4 +50,4 @@ jobs:
           cache: pip
           cache-dependency-path: scripts/requirements.txt
       - run: pip install -r requirements.txt
-      - run: python -m unittest -v test_generate_logs
+      - run: python -m unittest -v test_generate_logs test_run_experiments
